@@ -39,6 +39,9 @@ class TunPacketForwarder(
         private const val MTU = 1500
         private const val PROTO_TCP = 6
         private const val PROTO_UDP = 17
+        private const val MSS = 1460
+        // TCP MSS option: kind=2, len=4, value=1460 — sent only in SYN+ACK
+        private val MSS_OPTION = byteArrayOf(0x02, 0x04, 0x05, 0xb4.toByte())
     }
 
     private val connections = ConcurrentHashMap<String, TcpConn>()
@@ -145,9 +148,10 @@ class TunPacketForwarder(
                 )
                 connections[key] = conn
 
-                // Respond immediately so browser doesn't time out waiting for SYN+ACK
+                // Respond immediately so browser doesn't time out waiting for SYN+ACK.
+                // MSS=1460 so the peer sends full-size segments instead of the 536-byte default.
                 writeTun(buildTcp(dstIp, dstPort, srcIp, srcPort,
-                    serverInitSeq, seq + 1, 0x12))  // SYN+ACK
+                    serverInitSeq, seq + 1, 0x12, options = MSS_OPTION))  // SYN+ACK
 
                 scope.launch(Dispatchers.IO) {
                     openSocksConn(key, conn)
@@ -208,16 +212,22 @@ class TunPacketForwarder(
                 }
             }
 
-            val buf = ByteArray(16384) // TLS records fit in one read at 16 KB
+            val buf = ByteArray(16384) // 16 KB: fits one TLS record per read
             try {
                 while (true) {
                     val n = socket.getInputStream().read(buf)
                     if (n <= 0) break
-                    val data = buf.copyOf(n)
-                    writeTun(buildTcp(conn.dstIp, conn.dstPort,
-                        conn.srcIp, conn.srcPort,
-                        conn.serverSeq, conn.clientSeq, 0x18, data))
-                    conn.serverSeq += n
+                    // Chunk into MSS-sized segments so we never exceed IP MTU.
+                    var off = 0
+                    while (off < n) {
+                        val end = minOf(off + MSS, n)
+                        writeTun(buildTcp(conn.dstIp, conn.dstPort,
+                            conn.srcIp, conn.srcPort,
+                            conn.serverSeq, conn.clientSeq, 0x18,
+                            buf.copyOfRange(off, end)))
+                        conn.serverSeq += end - off
+                        off = end
+                    }
                 }
             } finally {
                 writerJob.cancel()
@@ -287,10 +297,12 @@ class TunPacketForwarder(
         dstIp: Int, dstPort: Int,
         seq: Int, ack: Int,
         flags: Int,
-        data: ByteArray = byteArrayOf()
+        data: ByteArray = byteArrayOf(),
+        options: ByteArray = byteArrayOf()
     ): ByteArray {
-        val tcpLen   = 20 + data.size
-        val totalLen = 20 + tcpLen
+        val tcpHdrLen = 20 + options.size          // options must be 4-byte aligned
+        val tcpLen    = tcpHdrLen + data.size
+        val totalLen  = 20 + tcpLen
         val buf = ByteBuffer.allocate(totalLen).order(ByteOrder.BIG_ENDIAN)
 
         buf.put(0x45.toByte()); buf.put(0)
@@ -304,10 +316,11 @@ class TunPacketForwarder(
         val t = 20
         buf.putShort(srcPort.toShort()); buf.putShort(dstPort.toShort())
         buf.putInt(seq); buf.putInt(ack)
-        buf.put(0x50.toByte()); buf.put(flags.toByte())
+        buf.put(((tcpHdrLen / 4) shl 4).toByte()); buf.put(flags.toByte())
         buf.putShort(0xFFFF.toShort())
         buf.putShort(0)
         buf.putShort(0)
+        if (options.isNotEmpty()) buf.put(options)
         if (data.isNotEmpty()) buf.put(data)
 
         buf.putShort(t + 16, tcpChecksum(srcIp, dstIp, buf.array(), t, tcpLen))
