@@ -1,175 +1,173 @@
 # DROP VPN
 
-A covert HTTPS/CDN transport that tunnels traffic through any CDN-fronted domain. The server masquerades as an ordinary website; the hidden channel rides inside two plausible-looking API endpoints. By design, an active prober cannot distinguish the host from a real web service.
+Скрытый VPN-транспорт поверх HTTPS/CDN. Сервер выглядит как обычный сайт — канал спрятан внутри двух правдоподобных API-эндпоинтов. Активный зонд не может отличить хост от настоящего веб-сервиса.
 
 ```
-Android app ──SOCKS5──► drop-client ──HTTPS POST/GET──► CDN ──► drop-server ──► Internet
+Android-приложение ──SOCKS5──► drop-client ──HTTPS POST/GET──► CDN ──► drop-server ──► Интернет
 ```
 
 ---
 
-## Architecture
+## Архитектура
 
-### Protocol
+### Протокол
 
-The channel is split into two HTTP endpoints:
+Канал разделён на два HTTP-эндпоинта:
 
-| Endpoint | Direction | Disguise |
+| Эндпоинт | Направление | Камуфляж |
 |---|---|---|
-| `POST /api/events` | client → server (upstream) | looks like telemetry |
-| `GET  /api/updates` | server → client (downstream) | long-poll "sync" |
+| `POST /api/events` | клиент → сервер (upstream) | выглядит как телеметрия |
+| `GET  /api/updates` | сервер → клиент (downstream) | long-poll «синхронизация» |
 
-Requests that fail authentication under the PSK receive ordinary website responses — the server is indistinguishable from a real site to anyone without the key (**probe resistance**).
+Запросы, не прошедшие аутентификацию под PSK, получают обычные ответы сайта — **probe resistance**: сервер неотличим от настоящего хоста без знания ключей.
 
-### Cryptography
+### Криптография
 
-- **Handshake**: Noise_N-style. The server holds a long-term X25519 static key. The client generates a fresh ephemeral X25519 key per session and performs ECDH against the server static key.
-- **Key derivation**: `HKDF(ECDH_shared, PSK)` → two AES-256-GCM keys (c→s and s→c).
-- **PSK role**: folded into HKDF as salt. Without the PSK the AEAD open fails, so unauthenticated probers get the decoy site.
-- **Framing**: `stream(4) | type(1) | len(2) | payload` — many SOCKS connections multiplexed over one HTTP channel.
-- **Windowing**: `windowSize=8` parallel POST lanes + 8 concurrent long-poll GETs, with a downstream reorder buffer ensuring in-order delivery.
+- **Рукопожатие**: стиль Noise_N. Сервер хранит долгосрочный X25519-ключ. Клиент генерирует эфемерный X25519-ключ на каждую сессию и выполняет ECDH с публичным ключом сервера.
+- **Derivation ключей**: `HKDF(ECDH_shared, PSK)` → два ключа AES-256-GCM (c→s и s→c).
+- **Роль PSK**: подмешивается в HKDF как соль. Без PSK AEAD-open завершается ошибкой — зонд получает страницу-приманку.
+- **Фреймирование**: `stream(4) | type(1) | len(2) | payload` — множество SOCKS-соединений мультиплексируется по одному HTTP-каналу.
+- **Оконный слой**: 8 параллельных POST-полос + 8 параллельных long-poll GET с reorder-буфером, гарантирующим доставку в исходном порядке.
 
 ### Android VPN
 
 ```
-All apps → TUN fd (VpnService)
-           → TunPacketForwarder  [in-process, same SELinux context]
-           → SOCKS5 127.0.0.1:8808
-           → libdrop.so subprocess (excluded from VPN via addDisallowedApplication)
-           → DROP tunnel → Internet
+Все приложения → TUN fd (VpnService)
+                 → TunPacketForwarder  [в процессе, тот же SELinux-контекст]
+                 → SOCKS5 127.0.0.1:8808
+                 → subprocess libdrop.so (исключён из VPN через addDisallowedApplication)
+                 → DROP-туннель → Интернет
 ```
 
-**Why in-process forwarder instead of tun2socks**: Android SELinux blocks `ioctl(TUNGETIFF)` in child processes even with an inherited fd. Running the forwarder in the VpnService process uses its SELinux context and works without root.
+**Почему форвардер в процессе, а не tun2socks-процесс**: Android SELinux блокирует `ioctl(TUNGETIFF)` в дочерних процессах даже при корректно переданном fd. Форвардер внутри VpnService использует его SELinux-контекст — работает без root.
 
-**DNS on restrictive operators**: Before creating the TUN interface, `OlcVpnService` reads the active network's `LinkProperties.dnsServers()` (operator-assigned DNS). This DNS is passed to `libdrop.so` via `-dns` and used in `TunPacketForwarder.forwardDns()` via a `protect()`-ed socket. This fixes DNS interception on operators like Megafon that block direct access to `8.8.8.8:53`.
+**DNS на блокирующих операторах**: перед созданием TUN-интерфейса `OlcVpnService` читает `LinkProperties.dnsServers()` активной сети (DNS, выданный оператором). Этот DNS передаётся в `libdrop.so` через флаг `-dns` и используется в `TunPacketForwarder.forwardDns()` через `protect()`-сокет. Фикс для операторов вроде Мегафон, блокирующих прямой доступ к `8.8.8.8:53`.
 
-**TCP ordering**: All TUN→SOCKS5 writes go through a per-connection `Channel<ByteArray>(UNLIMITED)` with a single writer coroutine, preventing `ERR_SSL_BAD_RECORD_MAC_ALERT` caused by out-of-order socket writes.
+**Порядок TCP**: все записи TUN→SOCKS5 проходят через `Channel<ByteArray>(UNLIMITED)` на соединение с единственным writer-корутином — предотвращает `ERR_SSL_BAD_RECORD_MAC_ALERT` из-за out-of-order записей в сокет.
 
 ---
 
-## Project Structure
+## Структура проекта
 
 ```
 DROP/
-├── dropt/                          Go source — zero external dependencies
-│   ├── cmd/server/main.go          HTTP covert transport server
-│   ├── cmd/client/main.go          SOCKS5 → DROP tunnel client (→ libdrop.so)
-│   ├── cmd/keygen/main.go          Key generation utility
-│   └── internal/wire/wire.go       Framing + AES-256-GCM + HKDF cryptography
+├── dropt/                          Go-исходники, ноль внешних зависимостей
+│   ├── cmd/server/main.go          HTTP-сервер скрытого транспорта
+│   ├── cmd/client/main.go          SOCKS5 → DROP-туннель клиент (→ libdrop.so)
+│   ├── cmd/keygen/main.go          Генератор ключей
+│   └── internal/wire/wire.go       Фреймирование + AES-256-GCM + HKDF
 │
-├── dropvpn-android/                 Android VPN app (Kotlin, minSdk 26)
+├── dropvpn-android/                Android VPN-приложение (Kotlin, minSdk 26)
 │   ├── app/src/main/java/xyz/olcrtc/android/
-│   │   ├── MainActivity.kt         UI, deep-link handler (drop://)
-│   │   ├── OlcVpnService.kt        VPN mode: TUN + TunPacketForwarder
-│   │   ├── TunnelService.kt        SOCKS5-only mode (no VPN)
-│   │   ├── TunPacketForwarder.kt   Raw IP → SOCKS5 forwarder + DNS relay
-│   │   ├── BinaryManager.kt        Manages libdrop.so subprocess
-│   │   ├── Prefs.kt                SharedPreferences helper
-│   │   └── BootReceiver.kt         Auto-start on boot
-│   ├── app/src/main/jniLibs/arm64-v8a/libdrop.so   Compiled drop-client binary
-│   └── build_android.sh            Rebuilds libdrop.so from source
+│   │   ├── MainActivity.kt         UI, обработка deep-link (drop://)
+│   │   ├── OlcVpnService.kt        VPN-режим: TUN + TunPacketForwarder
+│   │   ├── TunnelService.kt        Режим SOCKS5-прокси (без VPN)
+│   │   ├── TunPacketForwarder.kt   Сырые IP-пакеты → SOCKS5 + DNS-relay
+│   │   ├── BinaryManager.kt        Управление subprocess libdrop.so
+│   │   ├── Prefs.kt                SharedPreferences-хелпер
+│   │   └── BootReceiver.kt         Автозапуск при загрузке
+│   ├── app/src/main/jniLibs/arm64-v8a/libdrop.so   Скомпилированный drop-client
+│   └── build_android.sh            Пересборка libdrop.so из исходников
 │
 └── scripts/
-    └── deploy.sh                   One-command server deployment (Linux)
+    └── deploy.sh                   Одна команда для развёртывания на Linux
 ```
 
 ---
 
-## Server Deployment
+## Развёртывание сервера
 
-### Requirements
+### Требования
 
-- Linux server (amd64 or arm64), Ubuntu/Debian/CentOS/RHEL
-- Publicly accessible IP with DNS record pointing to it
-- Port 80 and 443 open (for Let's Encrypt + nginx)
-- A CDN service fronting your domain (Cloudflare, etc.)
+- Linux-сервер (amd64 или arm64): Ubuntu, Debian, CentOS, RHEL
+- Публичный IP, DNS-запись домена указывает на сервер
+- Открытые порты 80 и 443
+- CDN-сервис, проксирующий ваш домен (Cloudflare и др.)
 
-### Deploy
+### Запуск
 
 ```bash
 git clone https://github.com/qdpops/drop.git
 cd drop
 
 sudo bash scripts/deploy.sh \
-  --domain    your-origin.example.com \
-  --cdn-domain your-cdn.example.com \
+  --domain    ваш-сервер.example.com \
+  --cdn-domain ваш-cdn.example.com \
   --email     admin@example.com
 ```
 
-The script does everything automatically:
+Скрипт выполняет всё автоматически:
 
-1. Installs Go ≥ 1.21 if missing
-2. Builds `drop-server` and `drop-keygen` from source
-3. Generates X25519 static key + PSK, saves to `/etc/drop/config.env`
-4. Generates a secret random path (e.g. `/s/a3f8c1...`) for the Android quick-link page
-5. Installs the binary to `/opt/drop/drop-server`
-6. Creates and enables a `systemd` service (`drop.service`) running as a dedicated user
-7. Installs nginx + Certbot, obtains a Let's Encrypt TLS certificate
-8. Configures nginx as HTTPS terminator + reverse proxy with `proxy_buffering off` on `/api/`
-9. Sets up automatic certificate renewal
+1. Устанавливает Go ≥ 1.21, если не установлен
+2. Компилирует `drop-server` и `drop-keygen` из исходников
+3. Генерирует X25519 static key + PSK, сохраняет в `/etc/drop/config.env`
+4. Генерирует секретный случайный путь (например `/s/a3f8c1...`) для страницы быстрой ссылки
+5. Устанавливает бинарь в `/opt/drop/drop-server`
+6. Создаёт и включает `systemd`-сервис (`drop.service`) от отдельного пользователя
+7. Устанавливает nginx + Certbot, получает TLS-сертификат Let's Encrypt
+8. Настраивает nginx как HTTPS-терминатор + reverse proxy с `proxy_buffering off` на `/api/`
+9. Настраивает автоматическое обновление сертификата
 
-After deployment the output shows:
+После развёртывания скрипт выводит:
 
 ```
 Команда запуска клиента:
-  drop-client -url https://your-cdn.example.com/ -pub <PUB> -psk <PSK> -socks 127.0.0.1:1080
+  drop-client -url https://ваш-cdn.example.com/ -pub <PUB> -psk <PSK> -socks 127.0.0.1:1080
 
 Быстрая ссылка для Android-приложения:
-  https://your-cdn.example.com/s/a3f8c1...
-  drop://your-cdn.example.com/<PUB>/<PSK>
+  https://ваш-cdn.example.com/s/a3f8c1...
+  drop://ваш-cdn.example.com/<PUB>/<PSK>
 ```
 
-### CDN Configuration
+### Настройка CDN
 
-For the transport to work through a CDN, configure the following rules on the CDN side:
-
-| Rule | Setting |
+| Правило | Настройка |
 |---|---|
-| `/api/*` | **Cache: bypass** (never cache) |
-| `/api/updates` | **Response buffering: off** (or increase timeout to ≥ 60 s) |
-| **Origin read timeout** | ≥ 60 s (server holds long-poll for 15 s + slack) |
-| **Origin write timeout** | ≥ 35 s |
+| `/api/*` | **Cache: bypass** — никогда не кэшировать |
+| `/api/updates` | **Буферизация ответа: выкл** (или таймаут ≥ 60 с) |
+| **Origin read timeout** | ≥ 60 с (сервер держит long-poll 15 с + запас) |
+| **Origin write timeout** | ≥ 35 с |
 
-The rest of the site (`/`) can be cached normally — this is intentional for the camouflage.
+Остальной сайт (`/`) можно кэшировать — это намеренно, для камуфляжа.
 
-### Manual Server Flags
+### Флаги сервера вручную
 
 ```
-drop-server [flags]
+drop-server [флаги]
 
-  -listen    string   listen address (default ":8080")
-  -static    string   server static private key hex (from keygen)
-  -psk       string   pre-shared key hex (from keygen)
-  -site      string   directory of real static files to serve as the decoy site
-  -link-host string   public CDN hostname for drop:// links
-  -link-path string   secret URL path for the Android quick-link page
+  -listen    string   адрес прослушивания (по умолчанию ":8080")
+  -static    string   приватный X25519-ключ сервера в hex (из keygen)
+  -psk       string   pre-shared key в hex (из keygen)
+  -site      string   директория статики для сайта-приманки
+  -link-host string   публичный CDN-домен для drop://-ссылок
+  -link-path string   секретный URL-путь страницы быстрой ссылки
 ```
 
-### Key Generation
+### Генерация ключей
 
 ```bash
 cd dropt
 go run ./cmd/keygen
 
-# server_static_priv = <hex>   ← keep on server only
-# server_static_pub  = <hex>   ← ship to clients
-# psk                = <hex>   ← both sides
+# server_static_priv = <hex>   ← только на сервере
+# server_static_pub  = <hex>   ← передать клиентам
+# psk                = <hex>   ← обе стороны
 ```
 
 ---
 
-## Android App
+## Android-приложение
 
-### Build `libdrop.so`
+### Сборка `libdrop.so`
 
-The Android app runs `drop-client` as a subprocess (`libdrop.so` in `nativeLibraryDir`). Rebuild it whenever the Go client code changes:
+Приложение запускает `drop-client` как subprocess (`libdrop.so` в `nativeLibraryDir`). Пересобирайте при изменениях в Go-клиенте:
 
 ```bash
-# From the project root (where dropt/ lives):
+# Из корня проекта (где лежит dropt/):
 ./dropvpn-android/build_android.sh
 ```
 
-Or manually:
+Или вручную:
 
 ```bash
 cd dropt
@@ -179,13 +177,13 @@ GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
   ./cmd/client
 ```
 
-### Build APK
+### Сборка APK
 
-Open `dropvpn-android/` in **Android Studio** (Electric Eel or newer) and choose:
-- **Build → Generate Signed Bundle/APK** for release
-- **Run** button for debug install on a connected device
+Откройте `dropvpn-android/` в **Android Studio** (Electric Eel или новее):
+- **Build → Generate Signed Bundle/APK** — для release
+- Кнопка **Run** — для debug-установки на подключённое устройство
 
-Or via Gradle:
+Или через Gradle:
 
 ```bash
 cd dropvpn-android
@@ -193,90 +191,80 @@ cd dropvpn-android
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Requirements: Android 8.0+ (API 26), ARM64 device.
+Требования: Android 8.0+ (API 26), устройство ARM64.
 
-### Connect via Quick Link
+### Подключение через быструю ссылку
 
-After server deployment, open the quick-link URL in a browser on your Android device:
+После развёртывания откройте URL быстрой ссылки в браузере на Android-устройстве:
 
 ```
-https://your-cdn.example.com/s/<secret>
+https://ваш-cdn.example.com/s/<секрет>
 ```
 
-Tap **"Открыть в приложении"** — the app will parse the `drop://` deep link and pre-fill all settings automatically.
+Нажмите **«Открыть в приложении»** — приложение разберёт `drop://` deep link и заполнит все настройки автоматически.
 
-### Manual Configuration
+### Ручная настройка
 
-| Field | Value |
+| Поле | Значение |
 |---|---|
-| Server URL | `https://your-cdn.example.com/` |
-| Public key | `<server_static_pub>` hex from keygen |
-| PSK | `<psk>` hex from keygen |
-| SOCKS port | `8808` (default) |
+| Server URL | `https://ваш-cdn.example.com/` |
+| Public key | `<server_static_pub>` hex из keygen |
+| PSK | `<psk>` hex из keygen |
+| SOCKS port | `8808` (по умолчанию) |
 
-### Deep Link Format
+### Формат deep link
 
 ```
 drop://HOSTNAME/PUB_HEX/PSK_HEX
 ```
 
-Example:
-```
-drop://cdn.example.com/0035e92d4a8b.../89d576f7c3a1...
-```
+### Режимы работы
 
-### App Modes
-
-| Mode | Description |
+| Режим | Описание |
 |---|---|
-| **VPN mode** | All device traffic tunneled. Uses `VpnService` TUN interface + in-process `TunPacketForwarder`. |
-| **SOCKS5 mode** | Local `127.0.0.1:8808` proxy only. Configure manually in browser or use a proxy app. |
+| **VPN-режим** | Весь трафик устройства через туннель. Использует `VpnService`, TUN-интерфейс и `TunPacketForwarder` в процессе. |
+| **SOCKS5-режим** | Только локальный прокси `127.0.0.1:8808`. Настраивается вручную в браузере или через proxy-приложение. |
 
 ---
 
-## Building Server from Source
+## Сборка сервера из исходников
 
 ```bash
 cd dropt
 
-# Server
-go build -o drop-server ./cmd/server
-
-# Client (Linux/macOS/Windows)
-go build -o drop-client ./cmd/client
-
-# Key generator
-go build -o drop-keygen ./cmd/keygen
+go build -o drop-server  ./cmd/server
+go build -o drop-client  ./cmd/client
+go build -o drop-keygen  ./cmd/keygen
 ```
 
-Zero external dependencies — stdlib only. Binaries are self-contained.
+Внешних зависимостей нет — только стандартная библиотека Go. Бинарники самодостаточны.
 
 ---
 
-## Service Management
+## Управление сервисом
 
 ```bash
-# Status
+# Статус
 systemctl status drop
 
-# Logs (live)
+# Логи (live)
 journalctl -u drop -f
 
-# Restart
+# Перезапуск
 systemctl restart drop
 
-# nginx logs
+# Логи nginx
 tail -f /var/log/nginx/error.log
 ```
 
-Config file: `/etc/drop/config.env`
-Binary: `/opt/drop/drop-server`
+Конфиг: `/etc/drop/config.env`  
+Бинарь: `/opt/drop/drop-server`
 
 ---
 
-## Security Notes
+## Безопасность
 
-- The **PSK** and **server_static_priv** must be kept secret. Anyone with the PSK can connect.
-- **No forward secrecy** in the current version: compromise of `server_static_priv` exposes past sessions. Upgrading to a full Noise_XX handshake is the next planned step.
-- The quick-link URL at `/s/<random>` contains the PSK in the `drop://` URI — use HTTPS only and do not share the link publicly.
-- One quick-link URL can be shared with multiple users; all users share the same PSK.
+- **PSK** и **server_static_priv** должны оставаться секретными — любой владелец PSK может подключиться.
+- **Нет forward secrecy** в текущей версии: компрометация `server_static_priv` раскрывает прошлые сессии. Переход на полный Noise_XX — следующий запланированный шаг.
+- URL быстрой ссылки `/s/<random>` содержит PSK в `drop://`-URI — используйте только через HTTPS, не публикуйте ссылку открыто.
+- Одну быструю ссылку можно раздать нескольким пользователям — все подключаются с одним PSK.
