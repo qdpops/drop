@@ -14,10 +14,6 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.*
-import java.io.ByteArrayOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 import java.net.URI
 
 /**
@@ -74,11 +70,10 @@ class OlcVpnService : VpnService() {
         }
     )
 
-    @Volatile private var tunFd:           ParcelFileDescriptor? = null
-    @Volatile private var dropProcess:     Process? = null
-    @Volatile private var isRunning        = false
-    @Volatile private var localDnsProxy:   LocalDnsProxy? = null
-    @Volatile private var cachedResolverDns: String = "" // reuse across reconnects in same session
+    @Volatile private var tunFd:         ParcelFileDescriptor? = null
+    @Volatile private var dropProcess:   Process? = null
+    @Volatile private var isRunning      = false
+    @Volatile private var localDnsProxy: LocalDnsProxy? = null
 
     private var serverUrl = ""
     private var pubKey    = ""
@@ -92,8 +87,6 @@ class OlcVpnService : VpnService() {
             if (isRunning) {
                 broadcastLog("Смена сети — перезапуск VPN")
                 Log.i(TAG, "Network changed — killing session for reconnect")
-                // Invalidate cached resolver: the new network has different DNS.
-                cachedResolverDns = ""
                 // Null the fields before closing so runVpnSession's cleanup
                 // doesn't attempt a second close and throw IOException.
                 dropProcess?.destroy(); dropProcess = null
@@ -183,40 +176,20 @@ class OlcVpnService : VpnService() {
      */
     private suspend fun runVpnSession(binaryPath: String) {
         // publicDns: pushed via addDnsServer() — what devices behind the VPN use.
-        // The manual DNS field in the UI controls this. Falls back to 8.8.8.8 when:
-        //  - not set (user left the field blank), or
-        //  - set to a private/carrier-local IP that won't route through the tunnel.
+        // The manual DNS field controls this; falls back to 8.8.8.8 when blank or
+        // set to a carrier-local IP that is not reachable from the DROP server.
         val publicDns = dnsServer.takeIf { it.isNotBlank() && isPublicIp(it) } ?: "8.8.8.8"
 
-        // resolverDns: passed as -dns to libdrop.so so it can reach the CDN hostname
-        // before the TUN interface is up. Always auto-detected per-session — never the
-        // manual DNS setting, which is carrier-specific and would break on other carriers.
-        // Cached across reconnects so we don't re-probe on every session restart.
-        var resolverDns = cachedResolverDns
-        if (resolverDns.isEmpty()) {
-            val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
-            val rawOperatorDns = detectOperatorDns()
-            val dnsCandidates = buildList {
-                if (rawOperatorDns.isNotEmpty()) add(rawOperatorDns)
-                add("77.88.8.8")
-                add("8.8.8.8")
-            }.distinct()
-            resolverDns = if (hostname.isNotEmpty()) {
-                selectWorkingDns(hostname, dnsCandidates)
-            } else {
-                dnsCandidates.first()
-            }
-            // All external DNS blocked (e.g. MTS blocks UDP:53 and DoH to external IPs).
-            // Fall back to a local proxy that resolves via Android's system resolver.
-            if (resolverDns.isEmpty()) {
-                val proxy = localDnsProxy ?: LocalDnsProxy { broadcastLog(it) }.also {
-                    it.start(serviceScope)
-                    localDnsProxy = it
-                }
-                resolverDns = "127.0.0.1:${proxy.port}"
-            }
-            cachedResolverDns = resolverDns
+        // resolverDns: always LocalDnsProxy (127.0.0.1:PORT).
+        // Go's raw UDP sockets lose routing to the carrier DNS after TUN is
+        // established — even addDisallowedApplication doesn't fully protect them
+        // on all devices. LocalDnsProxy resolves via Android's InetAddress, which
+        // is always correctly routed by the OS regardless of VPN state.
+        val proxy = localDnsProxy ?: LocalDnsProxy { broadcastLog(it) }.also {
+            it.start(serviceScope)
+            localDnsProxy = it
         }
+        val resolverDns = "127.0.0.1:${proxy.port}"
         broadcastLog("DNS: tunnel=$publicDns resolver=$resolverDns")
 
         startDropProcess(binaryPath, resolverDns)
@@ -267,7 +240,6 @@ class OlcVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
-        cachedResolverDns = ""
         dropProcess?.destroy(); dropProcess = null
         tunFd?.close();         tunFd       = null
         localDnsProxy?.stop();  localDnsProxy = null
@@ -327,83 +299,6 @@ class OlcVpnService : VpnService() {
     }
 
     // ─── DNS helpers ──────────────────────────────────────────────────────────
-
-    private fun detectOperatorDns(): String {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        // activeNetwork is whatever Android routes new connections through.
-        // Must check it first: allNetworks can include a background mobile connection
-        // even when WiFi is active, causing us to return the wrong DNS.
-        val activeNet = cm.activeNetwork
-        if (activeNet != null) {
-            val caps = cm.getNetworkCapabilities(activeNet)
-            if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                val dns = cm.getLinkProperties(activeNet)?.dnsServers?.firstOrNull()?.hostAddress
-                if (!dns.isNullOrEmpty()) return dns
-            }
-        }
-        // Fallback: prefer WiFi over cellular
-        for (transport in listOf(NetworkCapabilities.TRANSPORT_WIFI, NetworkCapabilities.TRANSPORT_CELLULAR)) {
-            for (network in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(network) ?: continue
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-                if (!caps.hasTransport(transport)) continue
-                val dns = cm.getLinkProperties(network)?.dnsServers?.firstOrNull()?.hostAddress
-                if (!dns.isNullOrEmpty()) return dns
-            }
-        }
-        return "8.8.8.8"
-    }
-
-    /**
-     * Returns the first DNS from [candidates] that successfully resolves [hostname],
-     * or "" if all probes fail (caller should then try [resolveWithSystemDns]).
-     */
-    private suspend fun selectWorkingDns(hostname: String, candidates: List<String>): String {
-        for (dns in candidates) {
-            if (canResolveWithDns(hostname, dns)) {
-                broadcastLog("DNS probe: $dns → $hostname ✓")
-                return dns
-            }
-            broadcastLog("DNS probe: $dns → $hostname ✗")
-        }
-        broadcastLog("DNS: все UDP-пробы завершились неудачей")
-        return ""
-    }
-
-    private suspend fun canResolveWithDns(hostname: String, dnsServer: String): Boolean =
-        withContext(Dispatchers.IO) {
-            try {
-                val socket = DatagramSocket()
-                protect(socket) // bypass VPN routing so we hit the real network
-                socket.soTimeout = 3000
-                val query = buildDnsQuery(hostname)
-                socket.send(DatagramPacket(query, query.size, InetAddress.getByName(dnsServer), 53))
-                val buf = ByteArray(512)
-                socket.receive(DatagramPacket(buf, buf.size))
-                socket.close()
-                // ANCOUNT is at offset 6–7; >0 means we got at least one answer
-                val ancount = ((buf[6].toInt() and 0xFF) shl 8) or (buf[7].toInt() and 0xFF)
-                ancount > 0
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-    private fun buildDnsQuery(hostname: String): ByteArray {
-        val out = ByteArrayOutputStream()
-        out.write(byteArrayOf(0x12, 0x34))          // transaction ID
-        out.write(byteArrayOf(0x01, 0x00))          // flags: standard query, recursion desired
-        out.write(byteArrayOf(0x00, 0x01))          // QDCOUNT = 1
-        out.write(byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00)) // AN/NS/AR = 0
-        for (label in hostname.trimEnd('.').split(".")) {
-            out.write(label.length)
-            out.write(label.toByteArray())
-        }
-        out.write(0x00)                             // end of QNAME
-        out.write(byteArrayOf(0x00, 0x01))          // QTYPE = A
-        out.write(byteArrayOf(0x00, 0x01))          // QCLASS = IN
-        return out.toByteArray()
-    }
 
     private fun isPublicIp(ip: String): Boolean {
         val p = ip.split(".").mapNotNull { it.toIntOrNull() }

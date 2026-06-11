@@ -11,7 +11,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -166,11 +165,6 @@ type Client struct {
 	serverPub    *ecdh.PublicKey
 	hc           *http.Client
 	hostOverride string // non-empty when -url uses a raw IP; used as TLS SNI + Host header
-
-	// udpBlocked is set when carrier UDP:53 fails so subsequent dials skip the
-	// timeout and go straight to DoH. Reset at the start of each supervise
-	// iteration so a transient block doesn't permanently disable UDP DNS.
-	udpBlocked atomic.Bool
 
 	mu  sync.Mutex
 	cur *csession
@@ -433,78 +427,10 @@ func (c *Client) dispatcher(s *csession) {
 const maxResp = 4 << 20 // 4 MiB downstream per poll
 
 // ---------------------------------------------------------------------------
-// DNS over HTTPS fallback (for operators that intercept UDP port 53)
-// ---------------------------------------------------------------------------
-
-type dohProvider struct{ ip, sni string }
-
-// dohProviders lists DoH servers by fixed IP to avoid bootstrapping.
-// Yandex is first — it is on Russian CDN whitelists.
-var dohProviders = []dohProvider{
-    {"77.88.8.8", "common.dot.dns.yandex.net"},
-    {"8.8.8.8", "dns.google"},
-}
-
-type dohAnswer struct {
-    Type int    `json:"type"`
-    Data string `json:"data"`
-}
-type dohResp struct {
-    Answer []dohAnswer `json:"Answer"`
-}
-
-// dohClients are created once and reused across DoH calls to benefit from
-// TLS session resumption and connection keep-alive.
-var dohClients = func() []*http.Client {
-    clients := make([]*http.Client, len(dohProviders))
-    for i, p := range dohProviders {
-        clients[i] = &http.Client{
-            Timeout: 5 * time.Second,
-            Transport: &http.Transport{
-                TLSClientConfig: &tls.Config{ServerName: p.sni},
-                MaxIdleConnsPerHost: 2,
-                IdleConnTimeout:     60 * time.Second,
-            },
-        }
-    }
-    return clients
-}()
-
-func dohLookup(hostname string) (string, error) {
-    for i, p := range dohProviders {
-        req, _ := http.NewRequest("GET",
-            "https://"+p.ip+"/dns-query?name="+hostname+"&type=A", nil)
-        req.Header.Set("Accept", "application/dns-json")
-        resp, err := dohClients[i].Do(req)
-        if err != nil {
-            log.Printf("doh %s: %v", p.sni, err)
-            continue
-        }
-        var result dohResp
-        decErr := json.NewDecoder(resp.Body).Decode(&result)
-        resp.Body.Close()
-        if decErr != nil {
-            continue
-        }
-        for _, a := range result.Answer {
-            if a.Type == 1 { // A record
-                log.Printf("doh %s: %s → %s", p.sni, hostname, a.Data)
-                return a.Data, nil
-            }
-        }
-    }
-    return "", errors.New("doh: all providers failed")
-}
-
 // supervise keeps a live session, reconnecting on failure.
 func (c *Client) supervise() {
 	backoff := time.Second
 	for {
-		// Reset before each attempt: a stale udpBlocked=true from the previous
-		// session would skip UDP DNS entirely and send reconnects straight to DoH,
-		// which may also be blocked. Trying UDP first on each reconnect is cheap
-		// (1s timeout) and keeps the fallback chain working correctly.
-		c.udpBlocked.Store(false)
 		s, err := c.connect()
 		if err != nil {
 			log.Printf("connect: %v (retry in %s)", err, backoff)
@@ -685,7 +611,6 @@ func main() {
 		resolverAddr += ":53"
 	}
 
-	// Build the client first so dialCtx can reference cl.udpBlocked.
 	cl := &Client{
 		base:         *base,
 		psk:          psk,
@@ -706,39 +631,19 @@ func main() {
 		},
 	}
 
-	// dialCtx resolves hostnames with the carrier UDP DNS first.
-	// If UDP port 53 is intercepted/blocked (e.g. MTS), it falls back to
-	// DNS over HTTPS (Yandex → Google) which travels over port 443.
-	// cl.udpBlocked is reset in supervise() before each reconnect attempt.
 	dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, splitErr := net.SplitHostPort(addr)
 		dial := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 		if splitErr != nil || net.ParseIP(host) != nil {
-			// Already an IP or unparseable — connect directly without DNS.
 			return dial.DialContext(ctx, network, addr)
 		}
-
-		var ip string
-		if !cl.udpBlocked.Load() {
-			// 1s timeout: fast fail when UDP:53 is blocked so DoH fallback starts quickly.
-			lookupCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-			addrs, err := udpResolver.LookupHost(lookupCtx, host)
-			cancel()
-			if err == nil && len(addrs) > 0 {
-				ip = addrs[0]
-			} else {
-				log.Printf("UDP DNS failed (%v) — switching to DoH", err)
-				cl.udpBlocked.Store(true)
-			}
+		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		addrs, err := udpResolver.LookupHost(lookupCtx, host)
+		cancel()
+		if err != nil || len(addrs) == 0 {
+			return nil, fmt.Errorf("DNS failed: %w", err)
 		}
-		if ip == "" {
-			var dohErr error
-			ip, dohErr = dohLookup(host)
-			if dohErr != nil {
-				return nil, fmt.Errorf("DNS failed (doh: %w)", dohErr)
-			}
-		}
-		return dial.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		return dial.DialContext(ctx, network, net.JoinHostPort(addrs[0], port))
 	}
 
 	var tlsCfg *tls.Config
