@@ -41,7 +41,7 @@ Android-приложение ──SOCKS5──► drop-client ──HTTPS POST/
 
 **Почему форвардер в процессе, а не tun2socks-процесс**: Android SELinux блокирует `ioctl(TUNGETIFF)` в дочерних процессах даже при корректно переданном fd. Форвардер внутри VpnService использует его SELinux-контекст — работает без root.
 
-**DNS на блокирующих операторах**: перед созданием TUN-интерфейса `OlcVpnService` читает `LinkProperties.dnsServers()` активной сети (DNS, выданный оператором). Этот DNS передаётся в `libdrop.so` через флаг `-dns` и используется в `TunPacketForwarder.forwardDns()` через `protect()`-сокет. Фикс для операторов вроде Мегафон, блокирующих прямой доступ к `8.8.8.8:53`.
+**DNS на блокирующих операторах**: перед созданием TUN-интерфейса `OlcVpnService` читает `LinkProperties.dnsServers()` активной сети (DNS, выданный оператором). Этот DNS передаётся в `libdrop.so` через флаг `-dns` и используется в `TunPacketForwarder.forwardDns()` через `protect()`-сокет. Фикс для некоторых Российских операторов, блокирующих прямой доступ к `8.8.8.8:53`.
 
 **Порядок TCP**: все записи TUN→SOCKS5 проходят через `Channel<ByteArray>(UNLIMITED)` на соединение с единственным writer-корутином — предотвращает `ERR_SSL_BAD_RECORD_MAC_ALERT` из-за out-of-order записей в сокет.
 
@@ -82,7 +82,7 @@ DROP/
 - Linux-сервер (amd64 или arm64): Ubuntu, Debian, CentOS, RHEL
 - Публичный IP, DNS-запись домена указывает на сервер
 - Открытые порты 80 и 443
-- CDN-сервис, проксирующий ваш домен (Cloudflare и др.)
+- CDN-сервис, проксирующий ваш домен (VK Cloud и др.)
 
 ### Запуск
 
