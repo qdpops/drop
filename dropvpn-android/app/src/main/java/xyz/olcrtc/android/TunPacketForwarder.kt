@@ -31,6 +31,7 @@ class TunPacketForwarder(
     private val tunFd: ParcelFileDescriptor,
     private val socksPort: Int,
     private val dnsServer: String,
+    private val dnsProxyPort: Int,
     private val onLog: (String) -> Unit,
     private val scope: CoroutineScope
 ) {
@@ -274,17 +275,20 @@ class TunPacketForwarder(
 
     private suspend fun forwardDns(query: ByteArray, srcIp: Int, srcPort: Int) {
         try {
+            // Send to LocalDnsProxy (127.0.0.1:dnsProxyPort) — loopback bypasses VPN
+            // naturally so protect() is not needed. Raw UDP to external DNS (8.8.8.8:53)
+            // fails on some operators (e.g. Megafon) after TUN is established.
             val sock = DatagramSocket()
-            vpnService.protect(sock)
             sock.soTimeout = 3_000
-            val dns = InetSocketAddress(dnsServer, 53)
-            sock.send(DatagramPacket(query, query.size, dns))
+            sock.send(DatagramPacket(query, query.size,
+                InetAddress.getByName("127.0.0.1"), dnsProxyPort))
             val resp = ByteArray(512)
             val dp   = DatagramPacket(resp, resp.size)
             sock.receive(dp)
             sock.close()
-            val respData = resp.copyOf(dp.length)
-            writeTun(buildUdp(ipToInt(dnsServer), 53, srcIp, srcPort, respData))
+            // Response must appear to come from dnsServer (e.g. 8.8.8.8) — that is
+            // what the app sent its query to, so the reply source must match.
+            writeTun(buildUdp(ipToInt(dnsServer), 53, srcIp, srcPort, resp.copyOf(dp.length)))
         } catch (e: Exception) {
             Log.w(TAG, "DNS failed: ${e.message}")
         }

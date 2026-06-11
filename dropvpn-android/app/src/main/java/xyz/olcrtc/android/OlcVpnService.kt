@@ -213,12 +213,13 @@ class OlcVpnService : VpnService() {
         broadcastLog("TUN fd=${fd.fd} created")
 
         TunPacketForwarder(
-            vpnService = this,
-            tunFd      = fd,
-            socksPort  = socksPort,
-            dnsServer  = publicDns,
-            onLog      = { line -> broadcastLog(line) },
-            scope      = serviceScope
+            vpnService   = this,
+            tunFd        = fd,
+            socksPort    = socksPort,
+            dnsServer    = publicDns,
+            dnsProxyPort = proxy.port,
+            onLog        = { line -> broadcastLog(line) },
+            scope        = serviceScope
         ).start()
 
         broadcastStatus(STATUS_VPN_UP)
