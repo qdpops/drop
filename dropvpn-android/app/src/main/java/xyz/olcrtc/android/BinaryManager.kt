@@ -46,12 +46,20 @@ object BinaryManager {
 
     /**
      * Builds the drop-client command line.
-     *  -url  : full server URL, e.g. https://example.cdn.ru/
+     *  -url  : full server URL (may be IP-based if hostname was pre-resolved by Kotlin)
      *  -pub  : server static public key (64-char hex)
      *  -psk  : pre-shared key (32-char hex)
      *  -socks: local SOCKS5 listen address
-     *  -dns  : DNS resolver for the server hostname (operator DNS, bypasses 8.8.8.8 blocking)
+     *  -dns  : DNS resolver for the server hostname (omitted when URL already uses a raw IP)
+     *  -host : TLS SNI + Host header override (set when URL contains a raw IP)
      */
-    fun buildCommand(path: String, url: String, pubKey: String, psk: String, port: Int, dns: String): List<String> =
-        listOf(path, "-url", url, "-pub", pubKey, "-psk", psk, "-socks", "127.0.0.1:$port", "-dns", dns)
+    fun buildCommand(
+        path: String, url: String, pubKey: String, psk: String, port: Int,
+        dns: String, hostOverride: String = ""
+    ): List<String> {
+        val cmd = mutableListOf(path, "-url", url, "-pub", pubKey, "-psk", psk, "-socks", "127.0.0.1:$port")
+        if (dns.isNotEmpty()) cmd.addAll(listOf("-dns", dns))
+        if (hostOverride.isNotEmpty()) cmd.addAll(listOf("-host", hostOverride))
+        return cmd
+    }
 }

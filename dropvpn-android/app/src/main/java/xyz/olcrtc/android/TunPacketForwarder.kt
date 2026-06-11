@@ -5,7 +5,8 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import java.io.*
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.net.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -41,6 +42,10 @@ class TunPacketForwarder(
     }
 
     private val connections = ConcurrentHashMap<String, TcpConn>()
+    // Single writer channel: all coroutines enqueue packets here; one dedicated
+    // coroutine drains them in order. Avoids @Synchronized contention when many
+    // connections write to TUN simultaneously.
+    private val tunWriteQueue = Channel<ByteArray>(Channel.UNLIMITED)
 
     private inner class TcpConn(
         @Volatile var clientSeq: Int,   // next expected seq from browser
@@ -58,24 +63,34 @@ class TunPacketForwarder(
     // ─── Entry point ─────────────────────────────────────────────────────────
 
     fun start() {
+        val output = FileOutputStream(tunFd.fileDescriptor)
+
+        // Dedicated writer: drains tunWriteQueue sequentially. Each write() to
+        // a TUN fd must be exactly one IP packet — no interleaving allowed.
+        scope.launch(Dispatchers.IO) {
+            for (pkt in tunWriteQueue) {
+                try { output.write(pkt) } catch (_: Exception) { break }
+            }
+        }
+
         scope.launch(Dispatchers.IO) {
             val input  = FileInputStream(tunFd.fileDescriptor)
-            val output = FileOutputStream(tunFd.fileDescriptor)
             val buffer = ByteArray(MTU)
             onLog("TUN forwarder started (SOCKS5 → 127.0.0.1:$socksPort, DNS → $dnsServer)")
 
             while (isActive) {
                 val len = try { input.read(buffer) } catch (_: Exception) { break }
                 if (len <= 0) continue
-                handlePacket(buffer.copyOf(len), output)
+                handlePacket(buffer.copyOf(len))
             }
+            tunWriteQueue.close()
             onLog("TUN forwarder stopped")
         }
     }
 
     // ─── Packet dispatch ─────────────────────────────────────────────────────
 
-    private fun handlePacket(pkt: ByteArray, out: FileOutputStream) {
+    private fun handlePacket(pkt: ByteArray) {
         if (pkt.size < 20) return
         val version = (pkt[0].toInt() ushr 4) and 0xF
         if (version != 4) return
@@ -87,14 +102,14 @@ class TunPacketForwarder(
         if (pkt.size < ihl) return
 
         when (proto) {
-            PROTO_TCP -> handleTcp(pkt, ihl, srcIp, dstIp, out)
-            PROTO_UDP -> handleUdp(pkt, ihl, srcIp, dstIp, out)
+            PROTO_TCP -> handleTcp(pkt, ihl, srcIp, dstIp)
+            PROTO_UDP -> handleUdp(pkt, ihl, srcIp, dstIp)
         }
     }
 
     // ─── TCP ─────────────────────────────────────────────────────────────────
 
-    private fun handleTcp(pkt: ByteArray, ipLen: Int, srcIp: Int, dstIp: Int, out: FileOutputStream) {
+    private fun handleTcp(pkt: ByteArray, ipLen: Int, srcIp: Int, dstIp: Int) {
         if (pkt.size < ipLen + 20) return
         val srcPort = readU16(pkt, ipLen)
         val dstPort = readU16(pkt, ipLen + 2)
@@ -131,18 +146,18 @@ class TunPacketForwarder(
                 connections[key] = conn
 
                 // Respond immediately so browser doesn't time out waiting for SYN+ACK
-                writeTun(out, buildTcp(dstIp, dstPort, srcIp, srcPort,
+                writeTun(buildTcp(dstIp, dstPort, srcIp, srcPort,
                     serverInitSeq, seq + 1, 0x12))  // SYN+ACK
 
                 scope.launch(Dispatchers.IO) {
-                    openSocksConn(key, conn, out)
+                    openSocksConn(key, conn)
                 }
             }
 
             isFin -> {
                 val conn = connections.remove(key)
                 if (conn != null) {
-                    writeTun(out, buildTcp(dstIp, dstPort, srcIp, srcPort,
+                    writeTun(buildTcp(dstIp, dstPort, srcIp, srcPort,
                         conn.serverSeq, seq + 1, 0x11))  // FIN+ACK
                     conn.outgoing.close()
                     conn.socket?.closeSilently()
@@ -155,12 +170,12 @@ class TunPacketForwarder(
                     conn != null -> {
                         // ACK immediately; queue data into channel for ordered SOCKS5 delivery
                         conn.clientSeq += payload.size
-                        writeTun(out, buildTcp(dstIp, dstPort, srcIp, srcPort,
+                        writeTun(buildTcp(dstIp, dstPort, srcIp, srcPort,
                             conn.serverSeq, conn.clientSeq, 0x10))  // ACK
                         conn.outgoing.trySend(payload.copyOf())
                     }
                     else -> {
-                        writeTun(out, buildTcp(dstIp, dstPort, srcIp, srcPort,
+                        writeTun(buildTcp(dstIp, dstPort, srcIp, srcPort,
                             0, seq + payload.size, 0x04))  // RST — unknown connection
                     }
                 }
@@ -170,7 +185,7 @@ class TunPacketForwarder(
 
     // ─── SOCKS5 connect (background) ─────────────────────────────────────────
 
-    private suspend fun openSocksConn(key: String, conn: TcpConn, out: FileOutputStream) {
+    private suspend fun openSocksConn(key: String, conn: TcpConn) {
         val dstIpStr = intToIp(conn.dstIp)
         try {
             val proxy  = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
@@ -193,13 +208,13 @@ class TunPacketForwarder(
                 }
             }
 
-            val buf = ByteArray(4096)
+            val buf = ByteArray(16384) // TLS records fit in one read at 16 KB
             try {
                 while (true) {
                     val n = socket.getInputStream().read(buf)
                     if (n <= 0) break
                     val data = buf.copyOf(n)
-                    writeTun(out, buildTcp(conn.dstIp, conn.dstPort,
+                    writeTun(buildTcp(conn.dstIp, conn.dstPort,
                         conn.srcIp, conn.srcPort,
                         conn.serverSeq, conn.clientSeq, 0x18, data))
                     conn.serverSeq += n
@@ -209,7 +224,7 @@ class TunPacketForwarder(
                 conn.outgoing.close()
                 if (connections.remove(key) != null) {
                     // Send FIN+ACK only if we're the one closing (not a browser-initiated FIN)
-                    writeTun(out, buildTcp(conn.dstIp, conn.dstPort,
+                    writeTun(buildTcp(conn.dstIp, conn.dstPort,
                         conn.srcIp, conn.srcPort, conn.serverSeq, conn.clientSeq, 0x11))
                 }
                 socket.closeSilently()
@@ -223,14 +238,14 @@ class TunPacketForwarder(
             Log.w(TAG, "SOCKS5 connect failed ($dstIpStr:${conn.dstPort}): ${e.message}")
             connections.remove(key)
             conn.outgoing.close()
-            writeTun(out, buildTcp(conn.dstIp, conn.dstPort,
+            writeTun(buildTcp(conn.dstIp, conn.dstPort,
                 conn.srcIp, conn.srcPort, 0, conn.clientSeq, 0x04))  // RST
         }
     }
 
     // ─── UDP / DNS ────────────────────────────────────────────────────────────
 
-    private fun handleUdp(pkt: ByteArray, ipLen: Int, srcIp: Int, dstIp: Int, out: FileOutputStream) {
+    private fun handleUdp(pkt: ByteArray, ipLen: Int, srcIp: Int, dstIp: Int) {
         if (pkt.size < ipLen + 8) return
         val srcPort = readU16(pkt, ipLen)
         val dstPort = readU16(pkt, ipLen + 2)
@@ -238,16 +253,16 @@ class TunPacketForwarder(
 
         when (dstPort) {
             53 -> scope.launch(Dispatchers.IO) {
-                forwardDns(payload, srcIp, srcPort, dstIp, out)
+                forwardDns(payload, srcIp, srcPort)
             }
             else -> {
                 // ICMP Port Unreachable: tells Chrome/Firefox to fall back from QUIC to TCP/HTTP2
-                writeTun(out, buildIcmpUnreachable(pkt, ipLen, srcIp, dstIp))
+                writeTun(buildIcmpUnreachable(pkt, ipLen, srcIp, dstIp))
             }
         }
     }
 
-    private suspend fun forwardDns(query: ByteArray, srcIp: Int, srcPort: Int, dstIp: Int, out: FileOutputStream) {
+    private suspend fun forwardDns(query: ByteArray, srcIp: Int, srcPort: Int) {
         try {
             val sock = DatagramSocket()
             vpnService.protect(sock)
@@ -259,7 +274,7 @@ class TunPacketForwarder(
             sock.receive(dp)
             sock.close()
             val respData = resp.copyOf(dp.length)
-            writeTun(out, buildUdp(ipToInt(dnsServer), 53, srcIp, srcPort, respData))
+            writeTun(buildUdp(ipToInt(dnsServer), 53, srcIp, srcPort, respData))
         } catch (e: Exception) {
             Log.w(TAG, "DNS failed: ${e.message}")
         }
@@ -370,9 +385,8 @@ class TunPacketForwarder(
 
     // ─── I/O ─────────────────────────────────────────────────────────────────
 
-    @Synchronized
-    private fun writeTun(out: FileOutputStream, pkt: ByteArray) {
-        try { out.write(pkt) } catch (_: Exception) {}
+    private fun writeTun(pkt: ByteArray) {
+        tunWriteQueue.trySend(pkt)
     }
 
     private fun Socket.closeSilently() = try { close() } catch (_: Exception) {}

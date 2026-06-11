@@ -161,10 +161,16 @@ func (s *csession) teardown() {
 // ---------------------------------------------------------------------------
 
 type Client struct {
-	base      string
-	psk       []byte
-	serverPub *ecdh.PublicKey
-	hc        *http.Client
+	base         string
+	psk          []byte
+	serverPub    *ecdh.PublicKey
+	hc           *http.Client
+	hostOverride string // non-empty when -url uses a raw IP; used as TLS SNI + Host header
+
+	// udpBlocked is set when carrier UDP:53 fails so subsequent dials skip the
+	// timeout and go straight to DoH. Reset at the start of each supervise
+	// iteration so a transient block doesn't permanently disable UDP DNS.
+	udpBlocked atomic.Bool
 
 	mu  sync.Mutex
 	cur *csession
@@ -194,6 +200,11 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, sid s
 	}
 	if sid != "" {
 		req.AddCookie(&http.Cookie{Name: "sid", Value: sid})
+	}
+	// When URL uses a raw IP (Kotlin pre-resolved the hostname), set the Host header
+	// so the CDN routes the request correctly.
+	if c.hostOverride != "" {
+		req.Host = c.hostOverride
 	}
 	return c.hc.Do(req)
 }
@@ -442,18 +453,29 @@ type dohResp struct {
     Answer []dohAnswer `json:"Answer"`
 }
 
-func dohLookup(hostname string) (string, error) {
-    for _, p := range dohProviders {
-        hc := &http.Client{
+// dohClients are created once and reused across DoH calls to benefit from
+// TLS session resumption and connection keep-alive.
+var dohClients = func() []*http.Client {
+    clients := make([]*http.Client, len(dohProviders))
+    for i, p := range dohProviders {
+        clients[i] = &http.Client{
             Timeout: 5 * time.Second,
             Transport: &http.Transport{
                 TLSClientConfig: &tls.Config{ServerName: p.sni},
+                MaxIdleConnsPerHost: 2,
+                IdleConnTimeout:     60 * time.Second,
             },
         }
+    }
+    return clients
+}()
+
+func dohLookup(hostname string) (string, error) {
+    for i, p := range dohProviders {
         req, _ := http.NewRequest("GET",
             "https://"+p.ip+"/dns-query?name="+hostname+"&type=A", nil)
         req.Header.Set("Accept", "application/dns-json")
-        resp, err := hc.Do(req)
+        resp, err := dohClients[i].Do(req)
         if err != nil {
             log.Printf("doh %s: %v", p.sni, err)
             continue
@@ -478,6 +500,11 @@ func dohLookup(hostname string) (string, error) {
 func (c *Client) supervise() {
 	backoff := time.Second
 	for {
+		// Reset before each attempt: a stale udpBlocked=true from the previous
+		// session would skip UDP DNS entirely and send reconnects straight to DoH,
+		// which may also be blocked. Trying UDP first on each reconnect is cheap
+		// (1s timeout) and keeps the fallback chain working correctly.
+		c.udpBlocked.Store(false)
 		s, err := c.connect()
 		if err != nil {
 			log.Printf("connect: %v (retry in %s)", err, backoff)
@@ -631,6 +658,7 @@ func main() {
 	pskHex := flag.String("psk", "", "pre-shared key (hex)")
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "local SOCKS5 listen address")
 	dnsAddr := flag.String("dns", "8.8.8.8:53", "DNS resolver for the server hostname (host or host:port)")
+	hostFlag := flag.String("host", "", "override TLS SNI and Host header (used when -url is a raw IP)")
 	flag.Parse()
 
 	if *base == "" || *pubHex == "" || *pskHex == "" {
@@ -656,6 +684,15 @@ func main() {
 	if resolverAddr != "" && !strings.Contains(resolverAddr, ":") {
 		resolverAddr += ":53"
 	}
+
+	// Build the client first so dialCtx can reference cl.udpBlocked.
+	cl := &Client{
+		base:         *base,
+		psk:          psk,
+		serverPub:    pub,
+		hostOverride: *hostFlag,
+	}
+
 	// UDP resolver: passed by the Android service (carrier's DNS from LinkProperties).
 	// Avoids relying on the VPN TUN DNS which is not ready yet when we start.
 	udpResolver := &net.Resolver{
@@ -669,13 +706,10 @@ func main() {
 		},
 	}
 
-	// udpBlocked is set to true after the first UDP DNS failure so subsequent
-	// dials skip the 5-second UDP timeout and go straight to DoH.
-	var udpBlocked atomic.Bool
-
 	// dialCtx resolves hostnames with the carrier UDP DNS first.
 	// If UDP port 53 is intercepted/blocked (e.g. MTS), it falls back to
 	// DNS over HTTPS (Yandex → Google) which travels over port 443.
+	// cl.udpBlocked is reset in supervise() before each reconnect attempt.
 	dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, splitErr := net.SplitHostPort(addr)
 		dial := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -685,15 +719,16 @@ func main() {
 		}
 
 		var ip string
-		if !udpBlocked.Load() {
-			lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if !cl.udpBlocked.Load() {
+			// 1s timeout: fast fail when UDP:53 is blocked so DoH fallback starts quickly.
+			lookupCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 			addrs, err := udpResolver.LookupHost(lookupCtx, host)
 			cancel()
 			if err == nil && len(addrs) > 0 {
 				ip = addrs[0]
 			} else {
 				log.Printf("UDP DNS failed (%v) — switching to DoH", err)
-				udpBlocked.Store(true)
+				cl.udpBlocked.Store(true)
 			}
 		}
 		if ip == "" {
@@ -706,20 +741,27 @@ func main() {
 		return dial.DialContext(ctx, network, net.JoinHostPort(ip, port))
 	}
 
-	cl := &Client{
-		base:      *base,
-		psk:       psk,
-		serverPub: pub,
-		hc: &http.Client{
-			Transport: &http.Transport{
-				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        32,
-				MaxIdleConnsPerHost: 32,
-				IdleConnTimeout:     90 * time.Second,
-				DialContext:         dialCtx,
-			},
-			// no global timeout; per-request contexts bound each call
+	var tlsCfg *tls.Config
+	if *hostFlag != "" {
+		// URL is a raw IP; use the original hostname for TLS SNI so the CDN's
+		// certificate validation succeeds and the CDN routes the request correctly.
+		tlsCfg = &tls.Config{ServerName: *hostFlag}
+	}
+
+	cl.hc = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+			// Force HTTP/1.1: each of the windowSize pollers gets its own TCP
+			// connection. With HTTP/2 multiplexing, a single CDN connection drop
+			// kills all pollers simultaneously, causing a full session restart.
+			// HTTP/1.1 limits blast radius to one poller at a time.
+			TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 32,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext:         dialCtx,
 		},
+		// no global timeout; per-request contexts bound each call
 	}
 
 	go cl.supervise()

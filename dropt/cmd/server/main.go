@@ -32,10 +32,10 @@ import (
 
 const (
 	maxBody      = 1 << 20  // 1 MiB per upstream POST
-	maxDownBatch = 3 << 20  // 3 MiB max payload per downstream response
-	pollHold     = 15 * time.Second
+	maxDownBatch = 1 << 20  // 1 MiB max payload per downstream response (smaller = faster first-byte delivery)
+	pollHold     = 8 * time.Second
 	dialTimeout  = 10 * time.Second
-	streamInBuf  = 64
+	streamInBuf  = 256      // per-stream inbound buffer; larger prevents HOL-block from slow targets
 	sessionIdleT = 2 * time.Minute
 )
 
@@ -357,6 +357,11 @@ func (srv *Server) processFrames(s *session, fs []wire.Frame) {
 				select {
 				case st.in <- f.Data:
 				case <-st.closed:
+				default:
+					// Buffer full: this stream is too slow to drain data.
+					// Close it rather than blocking all other streams in the session.
+					s.queue(wire.Frame{Stream: f.Stream, Type: wire.FrameRST})
+					s.closeStream(f.Stream)
 				}
 			}
 		case wire.FrameFIN, wire.FrameRST:
@@ -413,13 +418,16 @@ func (srv *Server) reaper() {
 		for sid, s := range srv.sessions {
 			if now.Sub(s.lastSeen) > sessionIdleT {
 				delete(srv.sessions, sid)
+				// Collect IDs under smu to avoid a data race with processFrames/connect.
 				s.smu.Lock()
+				ids := make([]uint32, 0, len(s.streams))
 				for id := range s.streams {
-					if st := s.streams[id]; st != nil && st.conn != nil {
-						st.conn.Close()
-					}
+					ids = append(ids, id)
 				}
 				s.smu.Unlock()
+				for _, id := range ids {
+					s.closeStream(id)
+				}
 			}
 		}
 		srv.mu.Unlock()
@@ -548,8 +556,8 @@ func main() {
 		Handler: mux,
 		// ReadTimeout covers reading the request body (upstream POST batches ≤ 1 MiB).
 		ReadTimeout: 35 * time.Second,
-		// WriteTimeout must exceed pollHold (15s) + nginx proxy_read_timeout (65s) margin.
-		// Set to 0 (no limit) — each handler manages its own context deadline instead.
+		// WriteTimeout: 0 — handlers manage their own deadlines via pollHold.
+		// pollHold (8s) must stay well below the CDN's origin timeout (~15s).
 		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
