@@ -70,10 +70,11 @@ class OlcVpnService : VpnService() {
         }
     )
 
-    @Volatile private var tunFd:         ParcelFileDescriptor? = null
-    @Volatile private var dropProcess:   Process? = null
-    @Volatile private var isRunning      = false
-    @Volatile private var localDnsProxy: LocalDnsProxy? = null
+    @Volatile private var tunFd:           ParcelFileDescriptor? = null
+    @Volatile private var dropProcess:     Process? = null
+    @Volatile private var isRunning        = false
+    @Volatile private var localDnsProxy:   LocalDnsProxy? = null
+    @Volatile private var activeNetwork:   android.net.Network? = null
 
     private var serverUrl = ""
     private var pubKey    = ""
@@ -81,17 +82,24 @@ class OlcVpnService : VpnService() {
     private var socksPort = 8808
     private var dnsServer = ""
 
-    // Network change: just kill the current session — the reconnect loop restarts it.
+    // Restart only on a genuine network switch (different Network object).
+    // onAvailable can fire repeatedly for the same network on some operators
+    // (e.g. MTS transitions LTE idle→active under load) — those must be ignored
+    // or the session enters a restart loop.
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: android.net.Network) {
-            if (isRunning) {
+            val prev = activeNetwork
+            activeNetwork = network
+            if (isRunning && prev != null && prev != network) {
                 broadcastLog("Смена сети — перезапуск VPN")
-                Log.i(TAG, "Network changed — killing session for reconnect")
-                // Null the fields before closing so runVpnSession's cleanup
-                // doesn't attempt a second close and throw IOException.
+                Log.i(TAG, "Network changed ($prev → $network) — killing session for reconnect")
                 dropProcess?.destroy(); dropProcess = null
                 tunFd?.close();         tunFd       = null
             }
+        }
+
+        override fun onLost(network: android.net.Network) {
+            if (network == activeNetwork) activeNetwork = null
         }
     }
 
@@ -244,7 +252,7 @@ class OlcVpnService : VpnService() {
         dropProcess?.destroy(); dropProcess = null
         tunFd?.close();         tunFd       = null
         localDnsProxy?.stop();  localDnsProxy = null
-        // Cancel all children so the reconnect loop and forwarder stop immediately.
+        activeNetwork = null
         serviceScope.coroutineContext[Job]?.cancelChildren()
         broadcastStatus(STATUS_VPN_DOWN)
         updateNotification(STATUS_VPN_DOWN)
