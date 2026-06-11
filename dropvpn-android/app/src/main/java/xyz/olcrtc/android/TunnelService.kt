@@ -262,12 +262,22 @@ class TunnelService : LifecycleService() {
     }
 
     private fun detectOperatorDns(): String {
-        for (network in connectivityManager.allNetworks) {
-            val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-            val dns = connectivityManager.getLinkProperties(network)?.dnsServers
-                ?.firstOrNull()?.hostAddress
-            if (!dns.isNullOrEmpty()) return dns
+        val activeNet = connectivityManager.activeNetwork
+        if (activeNet != null) {
+            val caps = connectivityManager.getNetworkCapabilities(activeNet)
+            if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                val dns = connectivityManager.getLinkProperties(activeNet)?.dnsServers?.firstOrNull()?.hostAddress
+                if (!dns.isNullOrEmpty()) return dns
+            }
+        }
+        for (transport in listOf(NetworkCapabilities.TRANSPORT_WIFI, NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            for (network in connectivityManager.allNetworks) {
+                val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                if (!caps.hasTransport(transport)) continue
+                val dns = connectivityManager.getLinkProperties(network)?.dnsServers?.firstOrNull()?.hostAddress
+                if (!dns.isNullOrEmpty()) return dns
+            }
         }
         return "8.8.8.8"
     }

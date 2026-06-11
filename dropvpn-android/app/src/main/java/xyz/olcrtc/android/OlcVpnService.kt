@@ -56,6 +56,7 @@ class OlcVpnService : VpnService() {
         private const val VPN_ROUTE      = "0.0.0.0"
         private const val VPN_PREFIX_LEN = 0
         private const val MTU            = 1500
+        private const val RECONNECT_DELAY_MS = 3000L
     }
 
     private val serviceScope = CoroutineScope(
@@ -68,9 +69,9 @@ class OlcVpnService : VpnService() {
         }
     )
 
-    private var tunFd:       ParcelFileDescriptor? = null
-    private var dropProcess: Process? = null
-    private var isRunning = false
+    @Volatile private var tunFd:       ParcelFileDescriptor? = null
+    @Volatile private var dropProcess: Process? = null
+    @Volatile private var isRunning = false
 
     private var serverUrl = ""
     private var pubKey    = ""
@@ -78,16 +79,14 @@ class OlcVpnService : VpnService() {
     private var socksPort = 8808
     private var dnsServer = ""
 
+    // Network change: just kill the current session — the reconnect loop restarts it.
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: android.net.Network) {
             if (isRunning) {
-                Log.i(TAG, "Network changed — restarting VPN")
                 broadcastLog("Смена сети — перезапуск VPN")
-                serviceScope.launch {
-                    stopVpn()
-                    delay(500)
-                    startVpn()
-                }
+                Log.i(TAG, "Network changed — killing session for reconnect")
+                dropProcess?.destroy()
+                tunFd?.close()
             }
         }
     }
@@ -147,79 +146,92 @@ class OlcVpnService : VpnService() {
 
     private suspend fun startVpn() {
         isRunning = true
-        broadcastStatus(STATUS_VPN_STARTING)
 
         val dropBinary = try {
             BinaryManager.getBinary(this)
         } catch (e: Exception) {
             broadcastStatus(STATUS_VPN_ERROR, "drop binary not found: ${e.message}")
+            isRunning = false
             return
         }
 
-        // publicDns: used inside the VPN tunnel for app DNS queries (addDnsServer + forwardDns).
-        // Must be a publicly routable address (not a carrier-local 10.x/192.168.x IP).
-        val publicDns = dnsServer.ifBlank { "8.8.8.8" }
+        // Reconnect loop: runs while isRunning, restarts after each session ends.
+        while (isRunning) {
+            broadcastStatus(STATUS_VPN_STARTING)
+            runVpnSession(dropBinary.absolutePath)
+            if (!isRunning) break
+            broadcastLog("Переподключение через ${RECONNECT_DELAY_MS / 1000} с...")
+            delay(RECONNECT_DELAY_MS)
+        }
+    }
 
-        // operatorDns: used by libdrop.so to resolve the CDN hostname *before* VPN is up.
-        // Operator's DNS is preferred so carriers that block 8.8.8.8:53 still work.
-        // If the operator DNS is a public IP (not RFC-1918), reuse it; otherwise fall back.
+    /**
+     * Runs one VPN session: starts drop-client, creates TUN, runs forwarder.
+     * Suspends until the session ends (drop process exits or tunFd is closed).
+     * Cleans up before returning so the outer loop can restart cleanly.
+     */
+    private suspend fun runVpnSession(binaryPath: String) {
+        // publicDns: for addDnsServer() and TunPacketForwarder DNS relay.
+        // Must be publicly routable. A carrier-local address (e.g., 192.168.1.1 from
+        // a home WiFi router saved on a previous session) will time out after a network
+        // switch, so fall back to 8.8.8.8 in that case.
+        val savedDns = dnsServer
+        val publicDns = if (savedDns.isNotBlank() && isPublicIp(savedDns)) savedDns else "8.8.8.8"
+
+        // operatorDns: for libdrop.so to resolve the CDN hostname before VPN is up.
+        // Use operator's DNS only if it is a public IP (some carriers give RFC-1918
+        // DNS addresses that are unreachable via protect()-ed sockets).
         val rawOperatorDns = detectOperatorDns()
         val operatorDns = if (isPublicIp(rawOperatorDns)) rawOperatorDns else publicDns
-        broadcastLog("DNS: VPN=$publicDns, resolver=$operatorDns")
+        broadcastLog("DNS: tunnel=$publicDns resolver=$operatorDns")
 
-        startDropProcess(dropBinary.absolutePath, operatorDns)
+        startDropProcess(binaryPath, operatorDns)
         broadcastLog("Waiting for SOCKS5 server...")
-        delay(2000)  // give drop-client time to connect
+        delay(2000)
 
-        val fd = buildTunInterface(publicDns) ?: run {
+        val fd = buildTunInterface(publicDns)
+        if (fd == null) {
             broadcastStatus(STATUS_VPN_ERROR, "Failed to create TUN interface")
+            dropProcess?.destroy(); dropProcess = null
             return
         }
         tunFd = fd
         broadcastLog("TUN fd=${fd.fd} created")
 
-        val forwarder = TunPacketForwarder(
+        TunPacketForwarder(
             vpnService = this,
             tunFd      = fd,
             socksPort  = socksPort,
             dnsServer  = publicDns,
             onLog      = { line -> broadcastLog(line) },
             scope      = serviceScope
-        )
-        forwarder.start()
+        ).start()
 
         broadcastStatus(STATUS_VPN_UP)
         updateNotification(STATUS_VPN_UP)
-        Log.i(TAG, "VPN UP — in-process forwarder active, SOCKS5 127.0.0.1:$socksPort, DNS $publicDns (resolver $operatorDns)")
+        Log.i(TAG, "VPN UP — SOCKS5 127.0.0.1:$socksPort DNS $publicDns resolver $operatorDns")
+
+        // Suspend here until drop-client exits (network change, error, or user stop).
+        withContext(Dispatchers.IO) { dropProcess?.waitFor() }
+
+        // Session ended — clean up before the loop decides whether to restart.
+        dropProcess?.destroy(); dropProcess = null
+        tunFd?.close();         tunFd       = null
+        broadcastStatus(STATUS_VPN_DOWN)
+        updateNotification(STATUS_VPN_DOWN)
+        broadcastLog("VPN сессия завершена")
     }
 
-    /**
-     * Returns the DNS server currently assigned by the operator (from the active
-     * non-VPN network's LinkProperties). Called before the VPN interface is created
-     * so [ConnectivityManager.allNetworks] still reflects the underlying network.
-     * Falls back to 8.8.8.8 if nothing is found.
-     */
-    private fun detectOperatorDns(): String {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        for (network in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(network) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-            val dns = cm.getLinkProperties(network)?.dnsServers
-                ?.firstOrNull()?.hostAddress
-            if (!dns.isNullOrEmpty()) return dns
-        }
-        return "8.8.8.8"
-    }
+    // ─── Stop (user-initiated) ────────────────────────────────────────────────
 
-    /** Returns true if [ip] is not an RFC-1918 / link-local / loopback private address. */
-    private fun isPublicIp(ip: String): Boolean {
-        val p = ip.split(".").mapNotNull { it.toIntOrNull() }
-        if (p.size != 4) return false
-        return !(p[0] == 10 ||
-                 p[0] == 127 ||
-                 (p[0] == 172 && p[1] in 16..31) ||
-                 (p[0] == 192 && p[1] == 168) ||
-                 (p[0] == 169 && p[1] == 254))
+    private fun stopVpn() {
+        isRunning = false
+        dropProcess?.destroy(); dropProcess = null
+        tunFd?.close();         tunFd       = null
+        // Cancel all children so the reconnect loop and forwarder stop immediately.
+        serviceScope.coroutineContext[Job]?.cancelChildren()
+        broadcastStatus(STATUS_VPN_DOWN)
+        updateNotification(STATUS_VPN_DOWN)
     }
 
     private fun unregisterNetworkCallback() {
@@ -227,15 +239,6 @@ class OlcVpnService : VpnService() {
             (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
                 .unregisterNetworkCallback(networkCallback)
         } catch (_: Exception) {}
-    }
-
-    private fun stopVpn() {
-        isRunning = false
-        dropProcess?.destroy(); dropProcess = null
-        tunFd?.close();         tunFd       = null
-        serviceScope.coroutineContext[Job]?.cancelChildren()
-        broadcastStatus(STATUS_VPN_DOWN)
-        updateNotification(STATUS_VPN_DOWN)
     }
 
     // ─── TUN interface ────────────────────────────────────────────────────────
@@ -267,6 +270,7 @@ class OlcVpnService : VpnService() {
                 .redirectErrorStream(true)
                 .directory(filesDir)
                 .start()
+            // Log reader exits naturally when the process exits.
             serviceScope.launch {
                 dropProcess?.inputStream?.bufferedReader()?.forEachLine { line ->
                     Log.d(TAG, "[drop] $line")
@@ -277,6 +281,44 @@ class OlcVpnService : VpnService() {
             Log.e(TAG, "Failed to start drop-client: ${e.message}")
             broadcastLog("Failed to start drop-client: ${e.message}")
         }
+    }
+
+    // ─── DNS helpers ──────────────────────────────────────────────────────────
+
+    private fun detectOperatorDns(): String {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        // activeNetwork is whatever Android routes new connections through.
+        // Must check it first: allNetworks can include a background mobile connection
+        // even when WiFi is active, causing us to return the wrong DNS.
+        val activeNet = cm.activeNetwork
+        if (activeNet != null) {
+            val caps = cm.getNetworkCapabilities(activeNet)
+            if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                val dns = cm.getLinkProperties(activeNet)?.dnsServers?.firstOrNull()?.hostAddress
+                if (!dns.isNullOrEmpty()) return dns
+            }
+        }
+        // Fallback: prefer WiFi over cellular
+        for (transport in listOf(NetworkCapabilities.TRANSPORT_WIFI, NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                if (!caps.hasTransport(transport)) continue
+                val dns = cm.getLinkProperties(network)?.dnsServers?.firstOrNull()?.hostAddress
+                if (!dns.isNullOrEmpty()) return dns
+            }
+        }
+        return "8.8.8.8"
+    }
+
+    private fun isPublicIp(ip: String): Boolean {
+        val p = ip.split(".").mapNotNull { it.toIntOrNull() }
+        if (p.size != 4) return false
+        return !(p[0] == 10 ||
+                 p[0] == 127 ||
+                 (p[0] == 172 && p[1] in 16..31) ||
+                 (p[0] == 192 && p[1] == 168) ||
+                 (p[0] == 169 && p[1] == 254))
     }
 
     // ─── Notifications ────────────────────────────────────────────────────────

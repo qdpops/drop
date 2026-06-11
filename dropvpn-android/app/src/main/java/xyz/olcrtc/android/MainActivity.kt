@@ -215,14 +215,38 @@ class MainActivity : AppCompatActivity() {
 
     private fun detectNetworkDns(): String {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-        for (network in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(network) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-            val dns = cm.getLinkProperties(network)?.dnsServers
-                ?.firstOrNull()?.hostAddress
-            if (!dns.isNullOrEmpty()) return dns
+        // activeNetwork is the network Android actually routes new connections through.
+        // Check it first so we don't accidentally return mobile DNS while on WiFi.
+        val activeNet = cm.activeNetwork
+        if (activeNet != null) {
+            val caps = cm.getNetworkCapabilities(activeNet)
+            if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                val dns = cm.getLinkProperties(activeNet)?.dnsServers?.firstOrNull()?.hostAddress
+                // Only keep publicly-routable addresses — carrier-local RFC-1918 DNS
+                // (192.168.1.1, 10.x.x.x) breaks after a network switch.
+                if (!dns.isNullOrEmpty() && isPublicDns(dns)) return dns
+            }
+        }
+        // Fallback: prefer WiFi over cellular, still require a public IP
+        for (transport in listOf(NetworkCapabilities.TRANSPORT_WIFI, NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                if (!caps.hasTransport(transport)) continue
+                val dns = cm.getLinkProperties(network)?.dnsServers?.firstOrNull()?.hostAddress
+                if (!dns.isNullOrEmpty() && isPublicDns(dns)) return dns
+            }
         }
         return "8.8.8.8"
+    }
+
+    private fun isPublicDns(ip: String): Boolean {
+        val p = ip.split(".").mapNotNull { it.toIntOrNull() }
+        if (p.size != 4) return false
+        return !(p[0] == 10 || p[0] == 127 ||
+                 (p[0] == 172 && p[1] in 16..31) ||
+                 (p[0] == 192 && p[1] == 168) ||
+                 (p[0] == 169 && p[1] == 254))
     }
 
     private fun savePrefs() {
