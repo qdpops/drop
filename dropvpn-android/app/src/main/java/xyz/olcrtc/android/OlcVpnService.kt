@@ -14,6 +14,11 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.URI
 
 /**
  * VPN mode: drop-client (SOCKS5) + in-process TunPacketForwarder (TUN → SOCKS5)
@@ -179,10 +184,22 @@ class OlcVpnService : VpnService() {
         val publicDns = if (savedDns.isNotBlank() && isPublicIp(savedDns)) savedDns else "8.8.8.8"
 
         // operatorDns: for libdrop.so to resolve the CDN hostname before VPN is up.
-        // Use operator's DNS only if it is a public IP (some carriers give RFC-1918
-        // DNS addresses that are unreachable via protect()-ed sockets).
+        // Probe candidates in order — use the first DNS that successfully resolves
+        // the server hostname. Falls back to 8.8.8.8 if none respond.
+        val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
         val rawOperatorDns = detectOperatorDns()
-        val operatorDns = if (isPublicIp(rawOperatorDns)) rawOperatorDns else publicDns
+        val dnsCandidates = buildList {
+            // Operator's DNS first — some operators block 8.8.8.8 but their own DNS works
+            if (isPublicIp(rawOperatorDns)) add(rawOperatorDns)
+            add(publicDns)       // user setting or 8.8.8.8
+            add("8.8.8.8")
+            add("1.1.1.1")
+        }.distinct()
+        val operatorDns = if (hostname.isNotEmpty()) {
+            selectWorkingDns(hostname, dnsCandidates)
+        } else {
+            dnsCandidates.first()
+        }
         broadcastLog("DNS: tunnel=$publicDns resolver=$operatorDns")
 
         startDropProcess(binaryPath, operatorDns)
@@ -309,6 +326,56 @@ class OlcVpnService : VpnService() {
             }
         }
         return "8.8.8.8"
+    }
+
+    /**
+     * Returns the first DNS from [candidates] that successfully resolves [hostname],
+     * or the last candidate as a last resort.
+     */
+    private suspend fun selectWorkingDns(hostname: String, candidates: List<String>): String {
+        for (dns in candidates) {
+            if (canResolveWithDns(hostname, dns)) {
+                broadcastLog("DNS probe: $dns → $hostname ✓")
+                return dns
+            }
+            broadcastLog("DNS probe: $dns → $hostname ✗")
+        }
+        return candidates.last()
+    }
+
+    private suspend fun canResolveWithDns(hostname: String, dnsServer: String): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val socket = DatagramSocket()
+                protect(socket) // bypass VPN routing so we hit the real network
+                socket.soTimeout = 3000
+                val query = buildDnsQuery(hostname)
+                socket.send(DatagramPacket(query, query.size, InetAddress.getByName(dnsServer), 53))
+                val buf = ByteArray(512)
+                socket.receive(DatagramPacket(buf, buf.size))
+                socket.close()
+                // ANCOUNT is at offset 6–7; >0 means we got at least one answer
+                val ancount = ((buf[6].toInt() and 0xFF) shl 8) or (buf[7].toInt() and 0xFF)
+                ancount > 0
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+    private fun buildDnsQuery(hostname: String): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(byteArrayOf(0x12, 0x34))          // transaction ID
+        out.write(byteArrayOf(0x01, 0x00))          // flags: standard query, recursion desired
+        out.write(byteArrayOf(0x00, 0x01))          // QDCOUNT = 1
+        out.write(byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00)) // AN/NS/AR = 0
+        for (label in hostname.trimEnd('.').split(".")) {
+            out.write(label.length)
+            out.write(label.toByteArray())
+        }
+        out.write(0x00)                             // end of QNAME
+        out.write(byteArrayOf(0x00, 0x01))          // QTYPE = A
+        out.write(byteArrayOf(0x00, 0x01))          // QCLASS = IN
+        return out.toByteArray()
     }
 
     private fun isPublicIp(ip: String): Boolean {
