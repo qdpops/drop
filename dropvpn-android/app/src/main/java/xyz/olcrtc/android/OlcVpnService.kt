@@ -75,6 +75,7 @@ class OlcVpnService : VpnService() {
     @Volatile private var isRunning        = false
     @Volatile private var localDnsProxy:   LocalDnsProxy? = null
     @Volatile private var activeNetwork:   android.net.Network? = null
+    private var vpnJob: Job? = null
 
     private var serverUrl = ""
     private var pubKey    = ""
@@ -133,7 +134,11 @@ class OlcVpnService : VpnService() {
             }
         }
         startForeground(NOTIFICATION_ID, buildNotification(STATUS_VPN_STARTING))
-        serviceScope.launch { startVpn() }
+        // Cancel any existing loop before starting a new one — prevents multiple
+        // concurrent startVpn() coroutines when onStartCommand fires more than once
+        // (START_STICKY restart, double-tap, or rapid intent delivery).
+        vpnJob?.cancel()
+        vpnJob = serviceScope.launch { startVpn() }
         return START_STICKY
     }
 
@@ -249,8 +254,9 @@ class OlcVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
-        dropProcess?.destroy(); dropProcess = null
-        tunFd?.close();         tunFd       = null
+        vpnJob?.cancel();       vpnJob        = null
+        dropProcess?.destroy(); dropProcess   = null
+        tunFd?.close();         tunFd         = null
         localDnsProxy?.stop();  localDnsProxy = null
         activeNetwork = null
         serviceScope.coroutineContext[Job]?.cancelChildren()
