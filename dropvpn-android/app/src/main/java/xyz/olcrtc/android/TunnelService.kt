@@ -18,6 +18,7 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.*
+import xyz.olcrtc.android.Prefs.dnsServer
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
@@ -163,7 +164,7 @@ class TunnelService : LifecycleService() {
             return
         }
 
-        val dns = detectOperatorDns()
+        val dns = dnsServer.ifBlank { detectOperatorDns() }
         val cmd = BinaryManager.buildCommand(binary.absolutePath, serverUrl, pubKey, psk, socksPort, dns)
         broadcastLog("Starting DROP -> SOCKS5 127.0.0.1:$socksPort (DNS $dns)")
 

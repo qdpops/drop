@@ -135,10 +135,10 @@ class OlcVpnService : VpnService() {
             return
         }
 
-        // Detect the operator's DNS before the VPN is up. This bypasses any
-        // operator-level blocking of 8.8.8.8 (e.g. Megafon).
-        val effectiveDns = detectOperatorDns()
-        broadcastLog("Operator DNS: $effectiveDns")
+        // Use DNS from app settings. Empty = auto-detect from the active network
+        // (handles operators like Megafon that block 8.8.8.8:53).
+        val effectiveDns = dnsServer.ifBlank { detectOperatorDns() }
+        broadcastLog("DNS: $effectiveDns")
 
         startDropProcess(dropBinary.absolutePath, effectiveDns)
         broadcastLog("Waiting for SOCKS5 server...")

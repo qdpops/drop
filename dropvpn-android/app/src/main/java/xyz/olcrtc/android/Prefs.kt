@@ -35,8 +35,8 @@ object Prefs {
         get() = sp(this).getBoolean("vpn_mode", false)
         set(v) = sp(this).edit { putBoolean("vpn_mode", v) }
 
-    /** DNS server used in VPN mode */
+    /** DNS server. Empty string = auto-detect from active network on each connect. */
     var Context.dnsServer: String
-        get() = sp(this).getString("dns_server", "8.8.8.8") ?: "8.8.8.8"
+        get() = sp(this).getString("dns_server", "") ?: ""
         set(v) = sp(this).edit { putString("dns_server", v) }
 }

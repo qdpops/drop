@@ -3,6 +3,8 @@ package xyz.olcrtc.android
 import android.Manifest
 import android.content.*
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.VpnService
 import android.os.*
@@ -204,10 +206,23 @@ class MainActivity : AppCompatActivity() {
         binding.etPub.setText(pubKey)
         binding.etPsk.setText(psk)
         binding.etPort.setText(socksPort.toString())
-        binding.etDns.setText(dnsServer)
+        // If DNS was never set — detect from the current network and pre-fill the field
+        binding.etDns.setText(dnsServer.ifBlank { detectNetworkDns() })
         binding.switchAutostart.isChecked = autoStart
         binding.toggleMode.check(if (vpnMode) binding.btnModeVpn.id else binding.btnModeProxy.id)
         updateModeHint()
+    }
+
+    private fun detectNetworkDns(): String {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val dns = cm.getLinkProperties(network)?.dnsServers
+                ?.firstOrNull()?.hostAddress
+            if (!dns.isNullOrEmpty()) return dns
+        }
+        return "8.8.8.8"
     }
 
     private fun savePrefs() {
@@ -217,7 +232,7 @@ class MainActivity : AppCompatActivity() {
         pubKey    = binding.etPub.text.toString().trim()
         psk       = binding.etPsk.text.toString().trim()
         socksPort = binding.etPort.text.toString().toIntOrNull() ?: 8808
-        dnsServer = binding.etDns.text.toString().trim().ifBlank { "8.8.8.8" }
+        dnsServer = binding.etDns.text.toString().trim()
     }
 
     private fun updateModeHint() {
@@ -265,7 +280,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(OlcVpnService.EXTRA_PUB,  binding.etPub.text.toString().trim())
                 putExtra(OlcVpnService.EXTRA_PSK,  binding.etPsk.text.toString().trim())
                 putExtra(OlcVpnService.EXTRA_PORT, binding.etPort.text.toString().toIntOrNull() ?: 8808)
-                putExtra(OlcVpnService.EXTRA_DNS,  binding.etDns.text.toString().trim().ifBlank { "8.8.8.8" })
+                putExtra(OlcVpnService.EXTRA_DNS,  binding.etDns.text.toString().trim())
             })
         vpnStatus = OlcVpnService.STATUS_VPN_STARTING
         updateUi()
