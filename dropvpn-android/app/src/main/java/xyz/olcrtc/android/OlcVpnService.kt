@@ -134,10 +134,12 @@ class OlcVpnService : VpnService() {
             }
         }
         startForeground(NOTIFICATION_ID, buildNotification(STATUS_VPN_STARTING))
-        // Cancel any existing loop before starting a new one — prevents multiple
-        // concurrent startVpn() coroutines when onStartCommand fires more than once
-        // (START_STICKY restart, double-tap, or rapid intent delivery).
+        // Cancel existing loop and eagerly kill the drop process so its port is
+        // released before the new session starts. The finally block in runVpnSession
+        // also does this, but may not complete before the new coroutine is scheduled.
         vpnJob?.cancel()
+        dropProcess?.destroy(); dropProcess = null
+        tunFd?.close();         tunFd       = null
         vpnJob = serviceScope.launch { startVpn() }
         return START_STICKY
     }
@@ -240,14 +242,18 @@ class OlcVpnService : VpnService() {
         Log.i(TAG, "VPN UP — SOCKS5 127.0.0.1:$socksPort DNS $publicDns resolver $resolverDns")
 
         // Suspend here until drop-client exits (network change, error, or user stop).
-        withContext(Dispatchers.IO) { dropProcess?.waitFor() }
-
-        // Session ended — clean up before the loop decides whether to restart.
-        dropProcess?.destroy(); dropProcess = null
-        tunFd?.close();         tunFd       = null
-        broadcastStatus(STATUS_VPN_DOWN)
-        updateNotification(STATUS_VPN_DOWN)
-        broadcastLog("VPN сессия завершена")
+        // finally guarantees cleanup even when the coroutine is cancelled (e.g. by
+        // vpnJob?.cancel() in onStartCommand) — without it CancellationException
+        // skips the cleanup block and leaves the process alive holding port 8808.
+        try {
+            withContext(Dispatchers.IO) { dropProcess?.waitFor() }
+        } finally {
+            dropProcess?.destroy(); dropProcess = null
+            tunFd?.close();         tunFd       = null
+            broadcastStatus(STATUS_VPN_DOWN)
+            updateNotification(STATUS_VPN_DOWN)
+            broadcastLog("VPN сессия завершена")
+        }
     }
 
     // ─── Stop (user-initiated) ────────────────────────────────────────────────
