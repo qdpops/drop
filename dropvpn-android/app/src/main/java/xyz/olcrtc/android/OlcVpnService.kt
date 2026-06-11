@@ -189,11 +189,12 @@ class OlcVpnService : VpnService() {
         val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
         val rawOperatorDns = detectOperatorDns()
         val dnsCandidates = buildList {
-            // Operator's DNS first — some operators block public DNS but their own works
-            if (isPublicIp(rawOperatorDns)) add(rawOperatorDns)
-            if (publicDns != "8.8.8.8" && publicDns != "77.88.8.8") add(publicDns)
-            add("77.88.8.8")     // Yandex DNS — widely reachable in Russia
-            add("8.8.8.8")
+            // Operator DNS always first — even RFC-1918 addresses work because
+            // the app is excluded from VPN via addDisallowedApplication, so
+            // libdrop.so sockets reach the carrier's private DNS directly.
+            if (rawOperatorDns.isNotEmpty()) add(rawOperatorDns)
+            add("77.88.8.8")   // Yandex DNS
+            add("8.8.8.8")     // Google DNS (libdrop.so falls back to DoH if UDP blocked)
         }.distinct()
         val operatorDns = if (hostname.isNotEmpty()) {
             selectWorkingDns(hostname, dnsCandidates)
