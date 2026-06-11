@@ -1,0 +1,31 @@
+# ── Compiled binaries ────────────────────────────────────────────
+drop-server
+drop-client
+drop-keygen
+*.exe
+
+# ── Go ────────────────────────────────────────────────────────────
+dropt/vendor/
+
+# ── Android / Gradle ─────────────────────────────────────────────
+.gradle/
+build/
+*.iml
+local.properties
+.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# ── Claude Code ──────────────────────────────────────────────────
+.claude/
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets (never commit) ────────────────────────────────────────
+.env
+config.env
+*_priv.key

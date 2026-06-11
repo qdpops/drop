@@ -1,0 +1,559 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <!-- ── Header ──────────────────────────────────── -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:paddingTop="20dp"
+            android:paddingBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="DROP"
+                android:textSize="32sp"
+                android:textStyle="bold"
+                android:textColor="@color/primary"
+                android:letterSpacing="0.05" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Свободный туннель"
+                android:textSize="13sp"
+                android:textColor="@color/on_surface_variant"
+                android:layout_marginTop="2dp" />
+
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="○ Не подключено"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginTop="12dp" />
+
+        </LinearLayout>
+
+        <!-- ── Mode toggle ─────────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            app:cardCornerRadius="16dp"
+            app:cardBackgroundColor="@color/surface">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Режим работы"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/on_surface_variant"
+                    android:layout_marginBottom="10dp" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/toggleMode"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    app:singleSelection="true"
+                    app:selectionRequired="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnModeProxy"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Прокси"
+                        android:textSize="13sp"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnModeVpn"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="VPN"
+                        android:textSize="13sp"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                <TextView
+                    android:id="@+id/tvModeHint"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Прокси: локальный SOCKS5 127.0.0.1:8808"
+                    android:textSize="12sp"
+                    android:textColor="@color/on_surface_variant"
+                    android:layout_marginTop="8dp" />
+
+                <TextView
+                    android:id="@+id/tvVpnBinaryWarning"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="libdrop.so не найден — пересоберите APK"
+                    android:textSize="12sp"
+                    android:textColor="@color/warning"
+                    android:layout_marginTop="6dp"
+                    android:visibility="gone" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Battery warning ─────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardBatteryWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone"
+            app:cardBackgroundColor="@color/warning_surface"
+            app:cardCornerRadius="12dp"
+            app:strokeColor="@color/warning"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:padding="12dp"
+                android:gravity="center_vertical">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Оптимизация батареи"
+                        android:textStyle="bold"
+                        android:textColor="@color/warning"
+                        android:textSize="13sp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Отключи ограничения для фоновой работы"
+                        android:textColor="@color/on_surface_variant"
+                        android:textSize="12sp"
+                        android:layout_marginTop="2dp" />
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btnBatteryFix"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Исправить"
+                    android:textSize="12sp"
+                    style="@style/Widget.Material3.Button.TonalButton" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Connection settings ─────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            app:cardCornerRadius="16dp"
+            app:cardBackgroundColor="@color/surface">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Параметры подключения"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/on_surface"
+                    android:layout_marginBottom="12dp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnPasteLink"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Вставить ссылку drop://"
+                    android:textSize="13sp"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_marginBottom="12dp" />
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/tilUrl"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="URL сервера (https://...)"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    android:layout_marginBottom="10dp">
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etUrl"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:singleLine="true"
+                        android:fontFamily="monospace"
+                        android:textSize="13sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/tilPub"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Публичный ключ сервера (hex)"
+                    app:endIconMode="password_toggle"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    android:layout_marginBottom="10dp">
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etPub"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textPassword"
+                        android:singleLine="true"
+                        android:fontFamily="monospace"
+                        android:textSize="13sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/tilPsk"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="PSK — предварительный ключ (hex)"
+                    app:endIconMode="password_toggle"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    android:layout_marginBottom="10dp">
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etPsk"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textPassword"
+                        android:singleLine="true"
+                        android:fontFamily="monospace"
+                        android:textSize="14sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/tilPort"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="SOCKS5 порт"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    android:layout_marginBottom="4dp">
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etPort"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:singleLine="true"
+                        android:text="8808"
+                        android:textSize="14sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── DNS (VPN mode only) ─────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardDns"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone"
+            app:cardCornerRadius="12dp"
+            app:cardBackgroundColor="@color/surface">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="DNS-сервер (VPN-режим)"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/on_surface"
+                    android:layout_marginBottom="8dp" />
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="DNS сервер"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etDns"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:singleLine="true"
+                        android:text="8.8.8.8"
+                        android:fontFamily="monospace"
+                        android:textSize="14sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="8.8.8.8 — Google  •  1.1.1.1 — Cloudflare  •  77.88.8.8 — Яндекс"
+                    android:textSize="11sp"
+                    android:textColor="@color/on_surface_variant"
+                    android:layout_marginTop="6dp" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Connect button ──────────────────────────── -->
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Подключить"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="12dp"
+            app:cornerRadius="14dp"
+            style="@style/Widget.Material3.Button" />
+
+        <!-- ── Proxy info card ─────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardProxy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone"
+            app:cardCornerRadius="12dp"
+            app:cardBackgroundColor="@color/success_surface"
+            app:strokeColor="@color/success"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:padding="14dp"
+                android:gravity="center_vertical">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Прокси активен"
+                        android:textStyle="bold"
+                        android:textColor="@color/success"
+                        android:textSize="13sp" />
+                    <TextView
+                        android:id="@+id/tvProxyAddress"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="SOCKS5 → 127.0.0.1:8808"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/on_surface"
+                        android:textSize="13sp"
+                        android:layout_marginTop="2dp" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnCopyProxy"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Копировать"
+                    android:textSize="12sp"
+                    style="@style/Widget.Material3.Button.OutlinedButton" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── VPN active card ─────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardVpnActive"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone"
+            app:cardCornerRadius="12dp"
+            app:cardBackgroundColor="@color/success_surface"
+            app:strokeColor="@color/success"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="VPN туннель активен"
+                    android:textStyle="bold"
+                    android:textColor="@color/success"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Весь трафик устройства направлен через DROP.\nDNS-запросы также защищены."
+                    android:textColor="@color/on_surface_variant"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Options ─────────────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            app:cardCornerRadius="12dp"
+            app:cardBackgroundColor="@color/surface">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:padding="14dp"
+                android:gravity="center_vertical">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Запускать при загрузке"
+                        android:textColor="@color/on_surface"
+                        android:textSize="14sp" />
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Автоматически подключаться после перезагрузки"
+                        android:textColor="@color/on_surface_variant"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/switchAutostart"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Log section ─────────────────────────────── -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardCornerRadius="12dp"
+            app:cardBackgroundColor="@color/surface">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:id="@+id/cardLogHeader"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:padding="14dp"
+                    android:gravity="center_vertical"
+                    android:background="?attr/selectableItemBackground">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Журнал"
+                        android:textStyle="bold"
+                        android:textColor="@color/on_surface"
+                        android:textSize="14sp" />
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnCopyLog"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Копировать"
+                        android:textSize="11sp"
+                        android:layout_marginEnd="4dp"
+                        style="@style/Widget.Material3.Button.TextButton" />
+                    <ImageView
+                        android:id="@+id/ivLogArrow"
+                        android:layout_width="20dp"
+                        android:layout_height="20dp"
+                        android:src="@android:drawable/arrow_down_float"
+                        android:rotation="0"
+                        android:contentDescription="expand" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvLog"
+                    android:layout_width="match_parent"
+                    android:layout_height="220dp"
+                    android:padding="12dp"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/log_text"
+                    android:background="@color/log_background"
+                    android:scrollbars="vertical"
+                    android:visibility="gone"
+                    android:hint="Логи появятся здесь..." />
+
+                <Button
+                    android:id="@+id/btnClearLog"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="end"
+                    android:layout_margin="8dp"
+                    android:text="Очистить"
+                    android:textSize="12sp"
+                    android:visibility="gone"
+                    style="@style/Widget.Material3.Button.TextButton" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ── Footer ──────────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="DROP • covert transport • WTFPL"
+            android:textSize="11sp"
+            android:textColor="@color/on_surface_variant"
+            android:gravity="center"
+            android:paddingBottom="8dp" />
+
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,26 @@
+*.iml
+.gradle/
+.idea/
+.DS_Store
+local.properties
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+# App build outputs
+app/build/
+app/release/
+
+# Gradle caches / daemon / native metadata (build artifacts, not source)
+caches/
+daemon/
+native/
+wrapper/dists/
+kotlin-profile/
+kotlin/
+android/
+
+# Keystore (never commit!)
+*.jks
+*.keystore
