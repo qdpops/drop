@@ -189,11 +189,11 @@ class OlcVpnService : VpnService() {
         val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
         val rawOperatorDns = detectOperatorDns()
         val dnsCandidates = buildList {
-            // Operator's DNS first — some operators block 8.8.8.8 but their own DNS works
+            // Operator's DNS first — some operators block public DNS but their own works
             if (isPublicIp(rawOperatorDns)) add(rawOperatorDns)
-            add(publicDns)       // user setting or 8.8.8.8
+            if (publicDns != "8.8.8.8" && publicDns != "77.88.8.8") add(publicDns)
+            add("77.88.8.8")     // Yandex DNS — widely reachable in Russia
             add("8.8.8.8")
-            add("1.1.1.1")
         }.distinct()
         val operatorDns = if (hostname.isNotEmpty()) {
             selectWorkingDns(hostname, dnsCandidates)
