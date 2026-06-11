@@ -32,7 +32,7 @@ object Prefs {
 
     /** true = VPN mode (all traffic), false = proxy mode (SOCKS5 only) */
     var Context.vpnMode: Boolean
-        get() = sp(this).getBoolean("vpn_mode", false)
+        get() = sp(this).getBoolean("vpn_mode", true)
         set(v) = sp(this).edit { putBoolean("vpn_mode", v) }
 
     /** DNS server. Empty string = auto-detect from active network on each connect. */
