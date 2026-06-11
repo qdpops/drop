@@ -133,6 +133,10 @@ class OlcVpnService : VpnService() {
                 dnsServer = intent.getStringExtra(EXTRA_DNS)  ?: ""
             }
         }
+        // START_STICKY restart delivers intent=null — params are empty because they
+        // came from Intent extras, not persisted storage. Read from SharedPreferences
+        // so the reconnect loop can restart with the correct configuration.
+        if (serverUrl.isEmpty()) restoreParamsFromPrefs()
         startForeground(NOTIFICATION_ID, buildNotification(STATUS_VPN_STARTING))
         // Cancel existing loop and eagerly kill the drop process so its port is
         // released before the new session starts. The finally block in runVpnSession
@@ -254,6 +258,15 @@ class OlcVpnService : VpnService() {
             updateNotification(STATUS_VPN_DOWN)
             broadcastLog("VPN сессия завершена")
         }
+    }
+
+    private fun restoreParamsFromPrefs() {
+        val sp = getSharedPreferences("drop_prefs", Context.MODE_PRIVATE)
+        serverUrl = sp.getString("server_url", "") ?: ""
+        pubKey    = sp.getString("pub_key",    "") ?: ""
+        psk       = sp.getString("psk",        "") ?: ""
+        socksPort = sp.getInt   ("socks_port", 8808)
+        dnsServer = sp.getString("dns_server", "") ?: ""
     }
 
     // ─── Stop (user-initiated) ────────────────────────────────────────────────
