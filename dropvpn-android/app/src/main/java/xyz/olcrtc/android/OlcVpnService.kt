@@ -190,7 +190,7 @@ class OlcVpnService : VpnService() {
 
         broadcastStatus(STATUS_VPN_UP)
         updateNotification(STATUS_VPN_UP)
-        Log.i(TAG, "VPN UP — in-process forwarder active, SOCKS5 127.0.0.1:$socksPort, DNS $effectiveDns")
+        Log.i(TAG, "VPN UP — in-process forwarder active, SOCKS5 127.0.0.1:$socksPort, DNS $publicDns (resolver $operatorDns)")
     }
 
     /**
