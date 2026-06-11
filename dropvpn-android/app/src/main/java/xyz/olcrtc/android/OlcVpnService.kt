@@ -76,13 +76,32 @@ class OlcVpnService : VpnService() {
     private var pubKey    = ""
     private var psk       = ""
     private var socksPort = 8808
-    private var dnsServer = "8.8.8.8"
+    private var dnsServer = ""
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: android.net.Network) {
+            if (isRunning) {
+                Log.i(TAG, "Network changed — restarting VPN")
+                broadcastLog("Смена сети — перезапуск VPN")
+                serviceScope.launch {
+                    stopVpn()
+                    delay(500)
+                    startVpn()
+                }
+            }
+        }
+    }
 
     // ─── Lifecycle ────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val req = android.net.NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        try { cm.registerNetworkCallback(req, networkCallback) } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -99,7 +118,7 @@ class OlcVpnService : VpnService() {
                 pubKey    = intent.getStringExtra(EXTRA_PUB)  ?: ""
                 psk       = intent.getStringExtra(EXTRA_PSK)  ?: ""
                 socksPort = intent.getIntExtra(EXTRA_PORT, 8808)
-                dnsServer = intent.getStringExtra(EXTRA_DNS)  ?: "8.8.8.8"
+                dnsServer = intent.getStringExtra(EXTRA_DNS)  ?: ""
             }
         }
         startForeground(NOTIFICATION_ID, buildNotification(STATUS_VPN_STARTING))
@@ -108,6 +127,7 @@ class OlcVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        unregisterNetworkCallback()
         stopVpn()
         stopForeground(STOP_FOREGROUND_REMOVE)
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
@@ -115,6 +135,7 @@ class OlcVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        unregisterNetworkCallback()
         stopVpn()
         stopForeground(STOP_FOREGROUND_REMOVE)
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
@@ -135,16 +156,22 @@ class OlcVpnService : VpnService() {
             return
         }
 
-        // Use DNS from app settings. Empty = auto-detect from the active network
-        // (handles operators like Megafon that block 8.8.8.8:53).
-        val effectiveDns = dnsServer.ifBlank { detectOperatorDns() }
-        broadcastLog("DNS: $effectiveDns")
+        // publicDns: used inside the VPN tunnel for app DNS queries (addDnsServer + forwardDns).
+        // Must be a publicly routable address (not a carrier-local 10.x/192.168.x IP).
+        val publicDns = dnsServer.ifBlank { "8.8.8.8" }
 
-        startDropProcess(dropBinary.absolutePath, effectiveDns)
+        // operatorDns: used by libdrop.so to resolve the CDN hostname *before* VPN is up.
+        // Operator's DNS is preferred so carriers that block 8.8.8.8:53 still work.
+        // If the operator DNS is a public IP (not RFC-1918), reuse it; otherwise fall back.
+        val rawOperatorDns = detectOperatorDns()
+        val operatorDns = if (isPublicIp(rawOperatorDns)) rawOperatorDns else publicDns
+        broadcastLog("DNS: VPN=$publicDns, resolver=$operatorDns")
+
+        startDropProcess(dropBinary.absolutePath, operatorDns)
         broadcastLog("Waiting for SOCKS5 server...")
         delay(2000)  // give drop-client time to connect
 
-        val fd = buildTunInterface(effectiveDns) ?: run {
+        val fd = buildTunInterface(publicDns) ?: run {
             broadcastStatus(STATUS_VPN_ERROR, "Failed to create TUN interface")
             return
         }
@@ -155,7 +182,7 @@ class OlcVpnService : VpnService() {
             vpnService = this,
             tunFd      = fd,
             socksPort  = socksPort,
-            dnsServer  = effectiveDns,
+            dnsServer  = publicDns,
             onLog      = { line -> broadcastLog(line) },
             scope      = serviceScope
         )
@@ -182,6 +209,24 @@ class OlcVpnService : VpnService() {
             if (!dns.isNullOrEmpty()) return dns
         }
         return "8.8.8.8"
+    }
+
+    /** Returns true if [ip] is not an RFC-1918 / link-local / loopback private address. */
+    private fun isPublicIp(ip: String): Boolean {
+        val p = ip.split(".").mapNotNull { it.toIntOrNull() }
+        if (p.size != 4) return false
+        return !(p[0] == 10 ||
+                 p[0] == 127 ||
+                 (p[0] == 172 && p[1] in 16..31) ||
+                 (p[0] == 192 && p[1] == 168) ||
+                 (p[0] == 169 && p[1] == 254))
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {}
     }
 
     private fun stopVpn() {

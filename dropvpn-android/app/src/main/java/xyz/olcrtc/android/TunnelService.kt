@@ -164,7 +164,11 @@ class TunnelService : LifecycleService() {
             return
         }
 
-        val dns = dnsServer.ifBlank { detectOperatorDns() }
+        // Use operator's DNS if it's public (e.g. Megafon blocks 8.8.8.8:53),
+        // otherwise use the DNS from settings (default 8.8.8.8).
+        val savedDns = dnsServer.ifBlank { "8.8.8.8" }
+        val operatorDns = detectOperatorDns()
+        val dns = if (isPublicIp(operatorDns)) operatorDns else savedDns
         val cmd = BinaryManager.buildCommand(binary.absolutePath, serverUrl, pubKey, psk, socksPort, dns)
         broadcastLog("Starting DROP -> SOCKS5 127.0.0.1:$socksPort (DNS $dns)")
 
@@ -266,6 +270,16 @@ class TunnelService : LifecycleService() {
             if (!dns.isNullOrEmpty()) return dns
         }
         return "8.8.8.8"
+    }
+
+    private fun isPublicIp(ip: String): Boolean {
+        val p = ip.split(".").mapNotNull { it.toIntOrNull() }
+        if (p.size != 4) return false
+        return !(p[0] == 10 ||
+                 p[0] == 127 ||
+                 (p[0] == 172 && p[1] in 16..31) ||
+                 (p[0] == 192 && p[1] == 168) ||
+                 (p[0] == 169 && p[1] == 254))
     }
 
     private fun acquireWakeLock() {
