@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"encoding/hex"
 	"flag"
@@ -20,8 +21,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"dropt/internal/wire"
@@ -541,14 +544,32 @@ func main() {
 	mux.HandleFunc("/", srv.handleLink) // serves link page or falls through to site
 
 	hs := &http.Server{
-		Addr:         *listen,
-		Handler:      mux,
-		ReadTimeout:  35 * time.Second,
-		WriteTimeout: 35 * time.Second,
+		Addr:    *listen,
+		Handler: mux,
+		// ReadTimeout covers reading the request body (upstream POST batches ≤ 1 MiB).
+		ReadTimeout: 35 * time.Second,
+		// WriteTimeout must exceed pollHold (15s) + nginx proxy_read_timeout (65s) margin.
+		// Set to 0 (no limit) — each handler manages its own context deadline instead.
+		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
 	log.Printf("DROP server on %s (site=%s)", *listen, siteSource(*siteDir))
-	log.Fatal(hs.ListenAndServe())
+
+	// Graceful shutdown: release the port cleanly so the next instance can bind
+	// immediately when systemd restarts the service (avoids "address already in use").
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-quit
+		log.Printf("shutting down (signal received)")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		hs.Shutdown(ctx) //nolint:errcheck
+	}()
+
+	if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("ListenAndServe: %v", err)
+	}
 }
 
 func siteSource(dir string) string {
