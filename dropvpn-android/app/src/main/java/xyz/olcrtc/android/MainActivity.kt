@@ -33,8 +33,12 @@ class MainActivity : AppCompatActivity() {
 
     private var proxyStatus = TunnelService.STATUS_DISCONNECTED
     private var vpnStatus   = OlcVpnService.STATUS_VPN_DOWN
-    private val logBuffer   = ArrayDeque<String>(500)
-    private val MAX_LOG_LINES = 300
+
+    companion object {
+        // Static buffer survives Activity recreation (rotation, etc.)
+        private val logBuffer     = ArrayDeque<String>(500)
+        private const val MAX_LOG_LINES = 300
+    }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -120,6 +124,11 @@ class MainActivity : AppCompatActivity() {
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(receiver, filter)
         checkBatteryOptimization()
+        // Restore log text from buffer — covers Activity recreation and logs missed while paused
+        if (logBuffer.isNotEmpty()) {
+            binding.tvLog.text = logBuffer.joinToString("\n", postfix = "\n")
+            scrollLogToBottom()
+        }
     }
 
     override fun onPause() {
@@ -194,6 +203,7 @@ class MainActivity : AppCompatActivity() {
             binding.tvLog.visibility       = if (v) View.GONE else View.VISIBLE
             binding.btnClearLog.visibility = if (v) View.GONE else View.VISIBLE
             binding.ivLogArrow.rotation    = if (v) 0f else 180f
+            if (!v) scrollLogToBottom()   // scroll to latest line when expanding
         }
 
         binding.switchAutostart.setOnCheckedChangeListener { _, checked -> autoStart = checked }
@@ -206,8 +216,9 @@ class MainActivity : AppCompatActivity() {
         binding.etPub.setText(pubKey)
         binding.etPsk.setText(psk)
         binding.etPort.setText(socksPort.toString())
-        // If DNS was never set — detect from the current network and pre-fill the field
-        binding.etDns.setText(dnsServer.ifBlank { detectNetworkDns() })
+        // Default to 8.8.8.8: the tunnel DNS must be reachable from the DROP server,
+        // not a carrier-local IP that only works on the subscriber's own network.
+        binding.etDns.setText(dnsServer.ifBlank { "8.8.8.8" })
         binding.switchAutostart.isChecked = autoStart
         binding.toggleMode.check(if (vpnMode) binding.btnModeVpn.id else binding.btnModeProxy.id)
         updateModeHint()
@@ -364,15 +375,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun appendLog(line: String) {
-        logBuffer.addLast(line)
-        while (logBuffer.size > MAX_LOG_LINES) logBuffer.removeFirst()
         val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+        val formatted = "[$ts] $line"
+        logBuffer.addLast(formatted)
+        while (logBuffer.size > MAX_LOG_LINES) logBuffer.removeFirst()
         runOnUiThread {
-            binding.tvLog.append("[$ts] $line\n")
-            val scroll = binding.tvLog.layout?.let {
-                it.getLineTop(binding.tvLog.lineCount) - binding.tvLog.height
-            } ?: 0
-            if (scroll > 0) binding.tvLog.scrollTo(0, scroll)
+            binding.tvLog.append("$formatted\n")
+            scrollLogToBottom()
+        }
+    }
+
+    private fun scrollLogToBottom() {
+        // post defers until after the layout pass — works even when tvLog just became VISIBLE
+        binding.tvLog.post {
+            val layout = binding.tvLog.layout ?: return@post
+            val scrollY = (layout.getLineTop(binding.tvLog.lineCount) - binding.tvLog.height)
+                .coerceAtLeast(0)
+            binding.tvLog.scrollTo(0, scrollY)
         }
     }
 

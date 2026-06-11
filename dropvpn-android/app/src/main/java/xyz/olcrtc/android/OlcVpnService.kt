@@ -74,9 +74,11 @@ class OlcVpnService : VpnService() {
         }
     )
 
-    @Volatile private var tunFd:       ParcelFileDescriptor? = null
-    @Volatile private var dropProcess: Process? = null
-    @Volatile private var isRunning = false
+    @Volatile private var tunFd:           ParcelFileDescriptor? = null
+    @Volatile private var dropProcess:     Process? = null
+    @Volatile private var isRunning        = false
+    @Volatile private var localDnsProxy:   LocalDnsProxy? = null
+    @Volatile private var cachedResolverDns: String = "" // reuse across reconnects in same session
 
     private var serverUrl = ""
     private var pubKey    = ""
@@ -90,8 +92,12 @@ class OlcVpnService : VpnService() {
             if (isRunning) {
                 broadcastLog("Смена сети — перезапуск VPN")
                 Log.i(TAG, "Network changed — killing session for reconnect")
-                dropProcess?.destroy()
-                tunFd?.close()
+                // Invalidate cached resolver: the new network has different DNS.
+                cachedResolverDns = ""
+                // Null the fields before closing so runVpnSession's cleanup
+                // doesn't attempt a second close and throw IOException.
+                dropProcess?.destroy(); dropProcess = null
+                tunFd?.close();         tunFd       = null
             }
         }
     }
@@ -176,36 +182,53 @@ class OlcVpnService : VpnService() {
      * Cleans up before returning so the outer loop can restart cleanly.
      */
     private suspend fun runVpnSession(binaryPath: String) {
-        // publicDns: for addDnsServer() and TunPacketForwarder DNS relay.
-        // Must be publicly routable. A carrier-local address (e.g., 192.168.1.1 from
-        // a home WiFi router saved on a previous session) will time out after a network
-        // switch, so fall back to 8.8.8.8 in that case.
-        val savedDns = dnsServer
-        val publicDns = if (savedDns.isNotBlank() && isPublicIp(savedDns)) savedDns else "8.8.8.8"
+        // publicDns: pushed via addDnsServer() — what devices behind the VPN use.
+        // The manual DNS field in the UI controls this. Falls back to 8.8.8.8 when:
+        //  - not set (user left the field blank), or
+        //  - set to a private/carrier-local IP that won't route through the tunnel.
+        val publicDns = dnsServer.takeIf { it.isNotBlank() && isPublicIp(it) } ?: "8.8.8.8"
 
-        // operatorDns: for libdrop.so to resolve the CDN hostname before VPN is up.
-        // Probe candidates in order — use the first DNS that successfully resolves
-        // the server hostname. Falls back to 8.8.8.8 if none respond.
-        val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
-        val rawOperatorDns = detectOperatorDns()
-        val dnsCandidates = buildList {
-            // Operator DNS always first — even RFC-1918 addresses work because
-            // the app is excluded from VPN via addDisallowedApplication, so
-            // libdrop.so sockets reach the carrier's private DNS directly.
-            if (rawOperatorDns.isNotEmpty()) add(rawOperatorDns)
-            add("77.88.8.8")   // Yandex DNS
-            add("8.8.8.8")     // Google DNS (libdrop.so falls back to DoH if UDP blocked)
-        }.distinct()
-        val operatorDns = if (hostname.isNotEmpty()) {
-            selectWorkingDns(hostname, dnsCandidates)
-        } else {
-            dnsCandidates.first()
+        // resolverDns: passed as -dns to libdrop.so so it can reach the CDN hostname
+        // before the TUN interface is up. Always auto-detected per-session — never the
+        // manual DNS setting, which is carrier-specific and would break on other carriers.
+        // Cached across reconnects so we don't re-probe on every session restart.
+        var resolverDns = cachedResolverDns
+        if (resolverDns.isEmpty()) {
+            val hostname = runCatching { URI(serverUrl).host }.getOrNull() ?: ""
+            val rawOperatorDns = detectOperatorDns()
+            val dnsCandidates = buildList {
+                if (rawOperatorDns.isNotEmpty()) add(rawOperatorDns)
+                add("77.88.8.8")
+                add("8.8.8.8")
+            }.distinct()
+            resolverDns = if (hostname.isNotEmpty()) {
+                selectWorkingDns(hostname, dnsCandidates)
+            } else {
+                dnsCandidates.first()
+            }
+            // All external DNS blocked (e.g. MTS blocks UDP:53 and DoH to external IPs).
+            // Fall back to a local proxy that resolves via Android's system resolver.
+            if (resolverDns.isEmpty()) {
+                val proxy = localDnsProxy ?: LocalDnsProxy { broadcastLog(it) }.also {
+                    it.start(serviceScope)
+                    localDnsProxy = it
+                }
+                resolverDns = "127.0.0.1:${proxy.port}"
+            }
+            cachedResolverDns = resolverDns
         }
-        broadcastLog("DNS: tunnel=$publicDns resolver=$operatorDns")
+        broadcastLog("DNS: tunnel=$publicDns resolver=$resolverDns")
 
-        startDropProcess(binaryPath, operatorDns)
+        startDropProcess(binaryPath, resolverDns)
         broadcastLog("Waiting for SOCKS5 server...")
-        delay(2000)
+        // Poll until the SOCKS5 port is open rather than sleeping a fixed interval.
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                java.net.Socket("127.0.0.1", socksPort).close()
+                break
+            } catch (_: Exception) { delay(100) }
+        }
 
         val fd = buildTunInterface(publicDns)
         if (fd == null) {
@@ -227,7 +250,7 @@ class OlcVpnService : VpnService() {
 
         broadcastStatus(STATUS_VPN_UP)
         updateNotification(STATUS_VPN_UP)
-        Log.i(TAG, "VPN UP — SOCKS5 127.0.0.1:$socksPort DNS $publicDns resolver $operatorDns")
+        Log.i(TAG, "VPN UP — SOCKS5 127.0.0.1:$socksPort DNS $publicDns resolver $resolverDns")
 
         // Suspend here until drop-client exits (network change, error, or user stop).
         withContext(Dispatchers.IO) { dropProcess?.waitFor() }
@@ -244,8 +267,10 @@ class OlcVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
+        cachedResolverDns = ""
         dropProcess?.destroy(); dropProcess = null
         tunFd?.close();         tunFd       = null
+        localDnsProxy?.stop();  localDnsProxy = null
         // Cancel all children so the reconnect loop and forwarder stop immediately.
         serviceScope.coroutineContext[Job]?.cancelChildren()
         broadcastStatus(STATUS_VPN_DOWN)
@@ -331,7 +356,7 @@ class OlcVpnService : VpnService() {
 
     /**
      * Returns the first DNS from [candidates] that successfully resolves [hostname],
-     * or the last candidate as a last resort.
+     * or "" if all probes fail (caller should then try [resolveWithSystemDns]).
      */
     private suspend fun selectWorkingDns(hostname: String, candidates: List<String>): String {
         for (dns in candidates) {
@@ -341,7 +366,8 @@ class OlcVpnService : VpnService() {
             }
             broadcastLog("DNS probe: $dns → $hostname ✗")
         }
-        return candidates.last()
+        broadcastLog("DNS: все UDP-пробы завершились неудачей")
+        return ""
     }
 
     private suspend fun canResolveWithDns(hostname: String, dnsServer: String): Boolean =
