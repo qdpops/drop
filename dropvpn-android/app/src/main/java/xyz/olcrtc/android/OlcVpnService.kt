@@ -232,12 +232,7 @@ class OlcVpnService : VpnService() {
         val resolverDns = "127.0.0.1:${proxy.port}"
         broadcastLog("DNS: tunnel=$publicDns resolver=$resolverDns")
 
-        startDropProcess(binaryPath, resolverDns)
-        // Capture the process reference that belongs to THIS session invocation.
-        // onStartCommand may launch a new session concurrently; the finally block
-        // must not destroy a replacement process that was assigned to dropProcess
-        // after our session started.
-        val ownProcess = dropProcess
+        val ownProcess = startDropProcess(binaryPath, resolverDns)
         broadcastLog("Waiting for SOCKS5 server...")
         // Poll until the SOCKS5 port is open rather than sleeping a fixed interval.
         val deadline = System.currentTimeMillis() + 5_000
@@ -343,24 +338,28 @@ class OlcVpnService : VpnService() {
 
     // ─── drop-client process ──────────────────────────────────────────────────
 
-    private fun startDropProcess(binaryPath: String, dns: String) {
+    private fun startDropProcess(binaryPath: String, dns: String): Process? {
         val cmd = BinaryManager.buildCommand(binaryPath, serverUrl, pubKey, psk, socksPort, dns)
         Log.i(TAG, "Starting drop-client: ${cmd.joinToString(" ") { if (it == psk) "***" else it }}")
-        try {
-            dropProcess = ProcessBuilder(cmd)
+        return try {
+            ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .directory(filesDir)
                 .start()
-            // Log reader exits naturally when the process exits.
-            serviceScope.launch {
-                dropProcess?.inputStream?.bufferedReader()?.forEachLine { line ->
-                    Log.d(TAG, "[drop] $line")
-                    broadcastLog(line)
+                .also { proc ->
+                    dropProcess = proc
+                    // Log reader exits naturally when the process exits.
+                    serviceScope.launch {
+                        proc.inputStream.bufferedReader().forEachLine { line ->
+                            Log.d(TAG, "[drop] $line")
+                            broadcastLog(line)
+                        }
+                    }
                 }
-            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start drop-client: ${e.message}")
             broadcastLog("Failed to start drop-client: ${e.message}")
+            null
         }
     }
 
