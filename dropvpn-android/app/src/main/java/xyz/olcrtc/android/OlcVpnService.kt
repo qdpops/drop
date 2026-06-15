@@ -53,6 +53,13 @@ class OlcVpnService : VpnService() {
         const val STATUS_VPN_ERROR     = "VPN_ERROR"
         const val STATUS_VPN_STARTING  = "VPN_STARTING"
 
+        const val ACTION_FINISH_APP  = "xyz.drop.FINISH_APP"
+        const val EXTRA_FINISH_APP   = "finish_app"
+
+        // Readable by MainActivity without waiting for the next broadcast — covers
+        // Activity recreation, screen-off resume, and START_STICKY restarts.
+        @Volatile var currentStatus: String = STATUS_VPN_DOWN
+
         private const val VPN_ADDRESS    = "10.233.233.1"
         private const val VPN_ROUTE      = "0.0.0.0"
         private const val VPN_PREFIX_LEN = 0
@@ -94,8 +101,11 @@ class OlcVpnService : VpnService() {
             if (isRunning && prev != null && prev != network) {
                 broadcastLog("Смена сети — перезапуск VPN")
                 Log.i(TAG, "Network changed ($prev → $network) — killing session for reconnect")
-                dropProcess?.destroy(); dropProcess = null
-                tunFd?.close();         tunFd       = null
+                // Capture before nulling: @Volatile read + call is not atomic,
+                // so a concurrent assignment between the read and the call would
+                // operate on the wrong object.
+                val proc = dropProcess; if (proc != null) { dropProcess = null; proc.destroy() }
+                val fd   = tunFd;   if (fd != null) { tunFd = null; fd.close() }
             }
         }
 
@@ -119,6 +129,17 @@ class OlcVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_VPN -> {
+                // startActivity before stopForeground: the foreground-service exemption
+                // for background activity launches is revoked by stopForeground on
+                // Android 10+, so the call must happen while we are still foreground.
+                if (intent.getBooleanExtra(EXTRA_FINISH_APP, false)) {
+                    startActivity(Intent(this@OlcVpnService, MainActivity::class.java).apply {
+                        action = ACTION_FINISH_APP
+                        addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                 Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                 Intent.FLAG_ACTIVITY_NEW_TASK)
+                    })
+                }
                 stopVpn()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
@@ -212,6 +233,11 @@ class OlcVpnService : VpnService() {
         broadcastLog("DNS: tunnel=$publicDns resolver=$resolverDns")
 
         startDropProcess(binaryPath, resolverDns)
+        // Capture the process reference that belongs to THIS session invocation.
+        // onStartCommand may launch a new session concurrently; the finally block
+        // must not destroy a replacement process that was assigned to dropProcess
+        // after our session started.
+        val ownProcess = dropProcess
         broadcastLog("Waiting for SOCKS5 server...")
         // Poll until the SOCKS5 port is open rather than sleeping a fixed interval.
         val deadline = System.currentTimeMillis() + 5_000
@@ -225,7 +251,8 @@ class OlcVpnService : VpnService() {
         val fd = buildTunInterface(publicDns)
         if (fd == null) {
             broadcastStatus(STATUS_VPN_ERROR, "Failed to create TUN interface")
-            dropProcess?.destroy(); dropProcess = null
+            ownProcess?.destroy()
+            if (dropProcess === ownProcess) dropProcess = null
             return
         }
         tunFd = fd
@@ -250,10 +277,15 @@ class OlcVpnService : VpnService() {
         // vpnJob?.cancel() in onStartCommand) — without it CancellationException
         // skips the cleanup block and leaves the process alive holding port 8808.
         try {
-            withContext(Dispatchers.IO) { dropProcess?.waitFor() }
+            withContext(Dispatchers.IO) { ownProcess?.waitFor() }
         } finally {
-            dropProcess?.destroy(); dropProcess = null
-            tunFd?.close();         tunFd       = null
+            // Destroy only OUR process. If onStartCommand replaced dropProcess
+            // with a new session's process before our finally runs, leave it alone.
+            ownProcess?.destroy()
+            if (dropProcess === ownProcess) dropProcess = null
+            // Same for tunFd: null the field only if nobody replaced it yet.
+            if (tunFd === fd) tunFd = null
+            try { fd.close() } catch (_: Exception) {}
             broadcastStatus(STATUS_VPN_DOWN)
             updateNotification(STATUS_VPN_DOWN)
             broadcastLog("VPN сессия завершена")
@@ -313,7 +345,7 @@ class OlcVpnService : VpnService() {
 
     private fun startDropProcess(binaryPath: String, dns: String) {
         val cmd = BinaryManager.buildCommand(binaryPath, serverUrl, pubKey, psk, socksPort, dns)
-        Log.i(TAG, "Starting drop-client: ${cmd.joinToString(" ")}")
+        Log.i(TAG, "Starting drop-client: ${cmd.joinToString(" ") { if (it == psk) "***" else it }}")
         try {
             dropProcess = ProcessBuilder(cmd)
                 .redirectErrorStream(true)
@@ -360,7 +392,10 @@ class OlcVpnService : VpnService() {
         )
         val stopIntent = PendingIntent.getService(
             this, 10,
-            Intent(this, OlcVpnService::class.java).apply { action = ACTION_STOP_VPN },
+            Intent(this, OlcVpnService::class.java).apply {
+                action = ACTION_STOP_VPN
+                putExtra(EXTRA_FINISH_APP, true)
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val (title, text) = when (status) {
@@ -386,6 +421,7 @@ class OlcVpnService : VpnService() {
     // ─── Broadcasts ───────────────────────────────────────────────────────────
 
     fun broadcastStatus(status: String, message: String = "") {
+        currentStatus = status
         LocalBroadcastManager.getInstance(this).sendBroadcast(
             Intent(BROADCAST_VPN_STATUS).apply {
                 putExtra("status", status); putExtra("message", message)

@@ -80,6 +80,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent?.action == OlcVpnService.ACTION_FINISH_APP) { finishAffinity(); return }
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         setupUI()
@@ -92,6 +93,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.action == OlcVpnService.ACTION_FINISH_APP) { finishAffinity(); return }
         handleDeepLink(intent)
     }
 
@@ -123,6 +125,11 @@ class MainActivity : AppCompatActivity() {
             addAction(OlcVpnService.BROADCAST_VPN_STATUS)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(receiver, filter)
+        // Sync button state from the service's in-memory status — covers cases where the
+        // Activity was paused (screen off, another app) and missed interim broadcasts, or
+        // where the service was already running when the Activity was (re)created.
+        vpnStatus = OlcVpnService.currentStatus
+        updateUi()
         checkBatteryOptimization()
         // Restore log text from buffer — covers Activity recreation and logs missed while paused
         if (logBuffer.isNotEmpty()) {

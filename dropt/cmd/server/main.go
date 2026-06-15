@@ -31,12 +31,14 @@ import (
 )
 
 const (
-	maxBody      = 1 << 20  // 1 MiB per upstream POST
-	maxDownBatch = 1 << 20  // 1 MiB max payload per downstream response (smaller = faster first-byte delivery)
-	pollHold     = 8 * time.Second
-	dialTimeout  = 10 * time.Second
-	streamInBuf  = 256      // per-stream inbound buffer; larger prevents HOL-block from slow targets
-	sessionIdleT = 2 * time.Minute
+	maxBody        = 1 << 20  // 1 MiB per upstream POST
+	maxDownBatch   = 1 << 20  // 1 MiB max payload per downstream response (smaller = faster first-byte delivery)
+	pollHold       = 12 * time.Second
+	dialTimeout    = 10 * time.Second
+	streamInBuf    = 256      // per-stream inbound buffer; larger prevents HOL-block from slow targets
+	sessionIdleT   = 2 * time.Minute
+	maxPendingSeqs = 64       // max out-of-order upstream batches held per session
+	maxOutbuf      = 1024     // max downstream frames buffered when no poller is connected
 )
 
 // ---------------------------------------------------------------------------
@@ -56,13 +58,23 @@ type upstreamBuf struct {
 
 // deliver deposits seq into the buffer and, if this goroutine wins procMu,
 // drains all consecutive in-order batches by calling fn on each.
-func (b *upstreamBuf) deliver(seq uint64, fs []wire.Frame, fn func([]wire.Frame)) {
+// Returns false when the seq gap exceeds maxPendingSeqs, signalling a broken
+// or malicious session that the caller should tear down.
+func (b *upstreamBuf) deliver(seq uint64, fs []wire.Frame, fn func([]wire.Frame)) bool {
 	b.mu.Lock()
+	if seq < b.nextSeq {
+		b.mu.Unlock()
+		return true // duplicate / already processed
+	}
+	if seq-b.nextSeq >= maxPendingSeqs {
+		b.mu.Unlock()
+		return false // gap too large: broken session or deliberate pending-map exhaustion
+	}
 	b.pending[seq] = fs
 	_, hasNext := b.pending[b.nextSeq]
 	b.mu.Unlock()
 	if !hasNext {
-		return
+		return true
 	}
 	b.procMu.Lock()
 	defer b.procMu.Unlock()
@@ -71,7 +83,7 @@ func (b *upstreamBuf) deliver(seq uint64, fs []wire.Frame, fn func([]wire.Frame)
 		batch, ok := b.pending[b.nextSeq]
 		if !ok {
 			b.mu.Unlock()
-			return
+			return true
 		}
 		delete(b.pending, b.nextSeq)
 		b.nextSeq++
@@ -110,6 +122,13 @@ type session struct {
 
 func (s *session) queue(f wire.Frame) {
 	s.omu.Lock()
+	if len(s.outbuf) >= maxOutbuf && f.Type == wire.FrameData {
+		// Downstream buffer full: RST the offending stream rather than
+		// buffering indefinitely when no poller is consuming.
+		s.omu.Unlock()
+		s.closeStream(f.Stream)
+		return
+	}
 	s.outbuf = append(s.outbuf, f)
 	s.omu.Unlock()
 	select {
@@ -196,6 +215,22 @@ func (srv *Server) get(sid string) *session {
 	return s
 }
 
+// deleteSession removes sid from the session table and closes all its streams.
+func (srv *Server) deleteSession(sid string, s *session) {
+	srv.mu.Lock()
+	delete(srv.sessions, sid)
+	srv.mu.Unlock()
+	s.smu.Lock()
+	ids := make([]uint32, 0, len(s.streams))
+	for id := range s.streams {
+		ids = append(ids, id)
+	}
+	s.smu.Unlock()
+	for _, id := range ids {
+		s.closeStream(id)
+	}
+}
+
 func (srv *Server) create(sid string, c2s, s2c *wire.Cipher) *session {
 	s := &session{
 		c2s: c2s, s2c: s2c,
@@ -245,9 +280,14 @@ func (srv *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				fakeOK(w)
 				return
 			}
-			s.upBuf.deliver(seq, frames, func(fs []wire.Frame) {
+			if !s.upBuf.deliver(seq, frames, func(fs []wire.Frame) {
 				srv.processFrames(s, fs)
-			})
+			}) {
+				log.Printf("session %s: upstream seq gap exceeded limit, closing", sid[:8])
+				srv.deleteSession(sid, s)
+				fakeOK(w)
+				return
+			}
 			srv.ack(w, s)
 			return
 		}
@@ -378,6 +418,15 @@ func (srv *Server) connect(s *session, id uint32, target string, st *stream) {
 		return
 	}
 	st.conn = conn
+	// If closeStream already fired while we were dialling (closeOnce consumed
+	// with st.conn==nil), the Once is exhausted and nobody will close conn.
+	// Detect that case and close it ourselves before starting any goroutines.
+	select {
+	case <-st.closed:
+		conn.Close()
+		return
+	default:
+	}
 
 	// target -> client
 	go func() {
@@ -557,7 +606,7 @@ func main() {
 		// ReadTimeout covers reading the request body (upstream POST batches ≤ 1 MiB).
 		ReadTimeout: 35 * time.Second,
 		// WriteTimeout: 0 — handlers manage their own deadlines via pollHold.
-		// pollHold (8s) must stay well below the CDN's origin timeout (~15s).
+		// pollHold (12s) must stay well below the CDN's origin timeout (~15s).
 		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}

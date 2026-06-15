@@ -28,13 +28,14 @@ import (
 )
 
 const (
-	userAgent    = "Notedeck/3.2 (sync)"
-	pollTimeout  = 25 * time.Second
-	postTimeout  = 30 * time.Second
-	batchMax     = 256
-	batchWindow  = 5 * time.Millisecond
-	windowSize   = 8        // parallel upstream lanes and concurrent downstream polls
-	maxBatchBody = 768<<10  // stay well under server's 1 MiB maxBody limit
+	userAgent      = "Notedeck/3.2 (sync)"
+	pollTimeout    = 25 * time.Second
+	postTimeout    = 30 * time.Second
+	batchMax       = 256
+	batchWindow    = 5 * time.Millisecond
+	windowSize     = 4        // parallel upstream lanes and concurrent downstream polls
+	maxBatchBody   = 768<<10  // stay well under server's 1 MiB maxBody limit
+	maxPendingSeqs = 64       // max out-of-order downstream batches held in the reorder buffer
 )
 
 // ---------------------------------------------------------------------------
@@ -54,8 +55,18 @@ type downReorderBuf struct {
 	ready   chan struct{} // capacity-1; pulsed when nextSeq arrives
 }
 
-func (rb *downReorderBuf) add(seq uint64, fs []wire.Frame) {
+// add returns false when the seq gap exceeds maxPendingSeqs, indicating the
+// session is broken (server bug or network corruption); the caller should die.
+func (rb *downReorderBuf) add(seq uint64, fs []wire.Frame) bool {
 	rb.mu.Lock()
+	if seq < rb.nextSeq {
+		rb.mu.Unlock()
+		return true // duplicate / already dispatched
+	}
+	if seq-rb.nextSeq >= maxPendingSeqs {
+		rb.mu.Unlock()
+		return false
+	}
 	rb.pending[seq] = fs
 	_, has := rb.pending[rb.nextSeq]
 	rb.mu.Unlock()
@@ -65,6 +76,7 @@ func (rb *downReorderBuf) add(seq uint64, fs []wire.Frame) {
 		default:
 		}
 	}
+	return true
 }
 
 // drain calls dispatch for every in-order frame, advancing nextSeq.
@@ -290,7 +302,9 @@ func (c *Client) sendBatch(s *csession, seq uint64, batch []wire.Frame) error {
 	if err != nil {
 		return err
 	}
-	s.downBuf.add(ackSeq, ackFrames)
+	if !s.downBuf.add(ackSeq, ackFrames) {
+		return fmt.Errorf("downstream seq gap too large (seq=%d), reconnecting", ackSeq)
+	}
 	return nil
 }
 
@@ -401,7 +415,11 @@ func (c *Client) poller(s *csession) {
 					s.die()
 					return
 				}
-				s.downBuf.add(seq, frames)
+				if !s.downBuf.add(seq, frames) {
+					log.Printf("poller: downstream seq gap too large (seq=%d), reconnecting", seq)
+					s.die()
+					return
+				}
 			}
 		}()
 	}
@@ -497,7 +515,7 @@ func (c *Client) handleSOCKS(conn net.Conn) {
 		}
 	}
 	if !send(wire.Frame{Stream: id, Type: wire.FrameSYN, Data: []byte(target)}) {
-		conn.Close()
+		s.dropStream(id) // closes conn and removes from streams map
 		return
 	}
 
