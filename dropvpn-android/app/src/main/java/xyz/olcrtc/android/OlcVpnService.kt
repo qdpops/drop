@@ -403,12 +403,13 @@ class OlcVpnService : VpnService() {
             STATUS_VPN_ERROR    -> "VPN ошибка"          to "Остановите и попробуйте снова"
             else                -> "VPN отключён"        to "DROP неактивен"
         }
+        val isActive = status != STATUS_VPN_DOWN
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title).setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(openIntent).setOngoing(true)
+            .setContentIntent(openIntent).setOngoing(isActive)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(android.R.drawable.ic_delete, "Стоп", stopIntent)
+            .apply { if (isActive) addAction(android.R.drawable.ic_delete, "Стоп", stopIntent) }
             .build()
     }
 

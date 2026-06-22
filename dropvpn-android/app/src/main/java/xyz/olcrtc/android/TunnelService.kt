@@ -45,6 +45,8 @@ class TunnelService : LifecycleService() {
         const val STATUS_DISCONNECTED = "DISCONNECTED"
         const val STATUS_ERROR        = "ERROR"
 
+        @Volatile var currentStatus: String = STATUS_DISCONNECTED
+
         private const val RECONNECT_DELAY_MS     = 3000L
         private const val MAX_RECONNECT_DELAY_MS = 60000L
     }
@@ -246,6 +248,7 @@ class TunnelService : LifecycleService() {
     }
 
     private fun broadcastStatus(status: String, message: String = "") {
+        currentStatus = status
         LocalBroadcastManager.getInstance(this).sendBroadcast(
             Intent(BROADCAST_STATUS).apply {
                 putExtra("status", status)

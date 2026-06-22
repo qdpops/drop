@@ -79,6 +79,18 @@
             </intent-filter>
         </receiver>
 
+        <!-- Quick Settings tile (панель быстрого доступа) -->
+        <service
+            android:name=".DropVpnTileService"
+            android:exported="true"
+            android:label="@string/tile_label"
+            android:icon="@drawable/ic_qs_tile"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
     </application>
 
 </manifest>
